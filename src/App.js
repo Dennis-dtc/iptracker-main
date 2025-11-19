@@ -24,7 +24,9 @@ import {
 // ✅ RIGHT
 import { firestore as db } from './firebaseConfig';
 import { setCleanerAvailability } from './services/availabilityService';  // 🔝 Top of file
-import { addDoc, serverTimestamp } from 'firebase/firestore';
+import { addDoc, serverTimestamp, updateDoc, doc } from 'firebase/firestore';
+import { update } from "firebase/database";
+
 
 
 
@@ -89,16 +91,22 @@ function RecenterMap({ coords, trigger }) {
 }
 
 function App() {
-  const [currentCoords, setCurrentCoords] = useState(null); 
+  const [currentCoords, setCurrentCoords] = useState(null);
+  const [customerCoords, setCustomerCoords] = useState(null); 
+  const [isTrackingCustomer, setIsTrackingCustomer] = useState(false);
   const [targetCoords, setTargetCoords] = useState(null);
   const [deviceId, setDeviceId] = useState(null); 
+  const [sessionId, setSessionId] = useState(null); // NEW
+  // track current booking (Firestore) and RTDB request key
+  const [currentRequestId, setCurrentRequestId] = useState(null);   // Firestore booking doc id
+  const [currentRequestKey, setCurrentRequestKey] = useState(null); // RTDB request key (e.g. cleaner uid or sessionId)
   const [sharing, setSharing] = useState(false);
   const [mode, setMode] = useState(null); 
   const [allLocations, setAllLocations] = useState({});
   const [userName, setUserName] = useState('');
   const [userRole, setUserRole] = useState('');
   const [userImage, setUserImage] = useState('');
-  const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [hasSubmitted, setHasSubmitted] = useState(false); 
   const [showRoleModal, setShowRoleModal] = useState(true);
   const [selectedRole, setSelectedRole] = useState(null);
   const [recenterTrigger, setRecenterTrigger] = useState(0);
@@ -110,6 +118,10 @@ function App() {
   const [isAvailable, setIsAvailable] = useState(true);
   const [incomingRequest, setIncomingRequest] = useState(null);
   const [customerNotice, setCustomerNotice] = useState(null); // for customer popup
+  const [currentCustomerRequest, setCurrentCustomerRequest] = useState(null); 
+  // JOB / CLEANER UX STATE
+  const [activeJob, setActiveJob] = useState(null); // { cleanerUid, customerUid, bookingId, status }
+  const [isProcessing, setIsProcessing] = useState(false); // show spinner / disable buttons during DB writes
 
 
 
@@ -122,7 +134,6 @@ const toggleAvailability = async () => {
   }
 };
 
-
   const handleSubmitUserInfo = () => {
   if (!userName || !userRole) {
     alert("Please enter your name and select a role.");
@@ -133,13 +144,13 @@ const toggleAvailability = async () => {
 };
 
 
-const enforceDeviceLimitAndSave = async (deviceId, coords) => {
-  if (!coords?.lat || !coords?.lng || !deviceId) return;
-  const safeDeviceId = deviceId.replace(/\./g, '_');
+const enforceDeviceLimitAndSave = async (_deviceId, coords) => {
+  if (!coords?.lat || !coords?.lng || !sessionId) return; // require sessionId
+  const safeSessionId = sessionId.replace(/\./g, '_');
   const locationsRef = ref(database, 'locations');
 
   try {
-    // ✅ Apply small offset for customer (simulate being ~100m away)
+    // Apply small offset for customer (simulate ~100m)
     let adjustedCoords = { ...coords };
     if (userRole === 'customer') {
       const offsetMeters = 100; // ~100 meters
@@ -157,22 +168,24 @@ const enforceDeviceLimitAndSave = async (deviceId, coords) => {
       console.log("📍 Customer offset applied (~100m east):", adjustedCoords);
     }
 
-    // ✅ Save normally (no jitter, just offset if needed)
-    await set(ref(database, `locations/${safeDeviceId}`), {
+    await set(ref(database, `locations/${safeSessionId}`), {
+      sessionId: safeSessionId,            // NEW: session id
+      deviceId: deviceId || null,         // original device id (browser)
+      uid: auth.currentUser?.uid || null, // firebase auth id (may be same for two tabs)
+      role: userRole || 'cleaner',
+      name: userName || 'Anonymous',
       lat: adjustedCoords.lat,
       lng: adjustedCoords.lng,
       timestamp: Date.now(),
-      role: userRole || 'cleaner',
-      name: userName || 'Anonymous',
-      uid: auth.currentUser?.uid || null,
-      isAvailable: true,
+      isAvailable: isAvailable,
     });
 
-    console.log(`💾 Saved location for ${safeDeviceId}`, adjustedCoords);
+    console.log(`💾 Saved location for ${safeSessionId}`, adjustedCoords);
   } catch (err) {
     console.error("❌ Error saving location:", err);
   }
 };
+
 
 
 
@@ -196,6 +209,7 @@ const hardcodedCleaners = [
 
 useEffect(() => {
   if (!sharing || userRole === 'viewer') return;
+  if (!sessionId) return; // wait until sessionId exists
 
   const watchId = navigator.geolocation.watchPosition(
     (pos) => {
@@ -215,58 +229,50 @@ useEffect(() => {
   );
 
   return () => navigator.geolocation.clearWatch(watchId);
-}, [mode, deviceId]);
+}, [mode, deviceId, sessionId, sharing]);
+
 
 const handleRoleSelect = async (role) => {
   setSelectedRole(role);
   setUserRole(role);
   setShowRoleModal(false);
 
-  if (role !== 'viewer') {
-    // 🔹 Try to reuse same ID if it exists
-    let existingId = localStorage.getItem('deviceId');
-    
-    if (!existingId || !existingId.startsWith(role)) {
-      // If no saved one or role changed → generate new
-      const rawId = uuidv4();
-      existingId = `${role}_${rawId}`;
-      localStorage.setItem('deviceId', existingId);
-    }
-
-    setDeviceId(existingId);
-    setSharing(true);
-    setMode('share');
-
-    // 🔹 Optional cleanup: remove old orphaned markers
-    // Only remove entries belonging to this same device/role
-    try {
-      const locationsRef = ref(database, 'locations');
-      const snapshot = await get(locationsRef);
-      const data = snapshot.val();
-
-      if (data) {
-        for (const [id, loc] of Object.entries(data)) {
-          // if old marker from same role & name "Anonymous" remains
-          if (loc.name === 'Anonymous' && loc.role === role && id !== existingId) {
-            await remove(ref(database, `locations/${id}`));
-            console.log(`🧹 Cleaned up old ${role} marker: ${id}`);
-          }
-        }
-      }
-    } catch (err) {
-      console.error("❌ Cleanup error:", err);
-    }
-
-  } else {
-    // Viewer doesn’t need to share
-    setDeviceId(null);
-    setSharing(false);
-    setMode('track');
+  // base device id per browser (keeps previous behavior)
+  let existingId = localStorage.getItem('deviceId');
+  if (!existingId || !existingId.startsWith(role)) {
+    const rawId = uuidv4();
+    existingId = `${role}_${rawId}`;
+    localStorage.setItem('deviceId', existingId);
   }
 
-  console.log("✅ Role selected:", role);
-  console.log("🧭 Mode set to:", role === 'viewer' ? 'track' : 'share');
+  // create a new session instance id so same browser can simulate multiple sessions
+  const instance = `${existingId}_${uuidv4().slice(0,6)}`; // e.g. customer_ab12cd_3f4e5a
+  setDeviceId(existingId);   // keep for backward compatibility
+  setSessionId(instance);    // IMPORTANT: this is what we will write to RTDB
+  setSharing(true);
+  setMode(role === 'viewer' ? 'track' : 'share');
+
+  // Optional cleanup of orphaned anonymous markers of same role
+  try {
+    const locationsRef = ref(database, 'locations');
+    const snapshot = await get(locationsRef);
+    const data = snapshot.val();
+
+    if (data) {
+      for (const [id, loc] of Object.entries(data)) {
+        if (loc.name === 'Anonymous' && loc.role === role && id !== instance) {
+          await remove(ref(database, `locations/${sessionId}`));
+          console.log(`🧹 Cleaned up old ${role} marker: ${id}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ Cleanup error:", err);
+  }
+
+  console.log("✅ Role selected:", role, "sessionId:", instance);
 };
+
 
 useEffect(() => {
   let storedId = localStorage.getItem('deviceId');
@@ -313,6 +319,15 @@ useEffect(() => {
       });
     }
   }
+
+  // ✅ track cleaner location if accepted
+  if (data.customerLat && data.customerLng) {
+    setCustomerCoords({
+      lat: data.customerLat,
+      lng: data.customerLng,
+    });
+  }
+
 });
 
   
@@ -355,6 +370,40 @@ useEffect(() => {
 }, []);
 
 useEffect(() => {
+  const locationsRef = ref(database, 'locations');
+
+  const unsubscribe = onValue(locationsRef, (snapshot) => {
+    const data = snapshot.val() || {};
+    console.log("📥 Real-time locations update:", data);
+    setAllLocations(data);
+  });
+
+  return () => unsubscribe();
+}, []);
+
+// Subscribe to customer live position via the allLocations object
+useEffect(() => {
+  if (!activeJob?.customerUid || !allLocations) {
+    setCustomerCoords(null);
+    return;
+  }
+
+  // find customer's latest location entry (they're stored under sessionId keys)
+  const entry = Object.entries(allLocations).find(([id, loc]) => loc.uid === activeJob.customerUid);
+  if (entry) {
+    const [, loc] = entry;
+    setCustomerCoords({ lat: loc.lat, lng: loc.lng });
+    // keep targetCoords in sync so route updates
+    setTargetCoords({ lat: loc.lat, lng: loc.lng });
+  } else {
+    // no location found — clear or leave last known
+    console.warn("Customer location not found in allLocations for", activeJob.customerUid);
+  }
+}, [allLocations, activeJob?.customerUid]);
+
+
+
+useEffect(() => {
   if (!user?.uid) return;
 
   const q = query(
@@ -392,67 +441,89 @@ useEffect(() => {
   return () => unsub();
 }, [user?.uid, chatWith]);
 
-  const visibleMarkers = Object.entries(allLocations)
-  .filter(([id, loc]) => {
-    if (!loc?.lat || !loc?.lng || !loc?.uid || !loc?.role) return false;
+  const visibleMarkers = Object.entries(allLocations).filter(([id, loc]) => {
+  if (!loc?.lat || !loc?.lng || !(loc?.uid || loc?.sessionId) || !loc?.role) return false;
 
-    if (userRole === 'viewer') {
-      return loc.role === 'cleaner' || loc.role === 'customer';
+  // CUSTOMER VIEW
+  if (userRole === 'customer') {
+    
+    if (loc.role !== 'cleaner') return false; // only show cleaners
+
+    if (currentCustomerRequest && currentCustomerRequest.cleanerUid) {
+      // Requester sees only the cleaner they requested
+      return loc.uid === currentCustomerRequest.cleanerUid;
     }
 
-    // Cleaners see customers
-    if (userRole === 'cleaner') {
-      return loc.role === 'customer' && loc.isAvailable;
-    }
+    // If no active request, show all available cleaners
+    return loc.isAvailable !== false;
+  }
 
-    // Customers see cleaners
-    if (userRole === 'customer') {
-      return loc.role === 'cleaner' && loc.isAvailable;
-    }
+  // CLEANER VIEW
+  if (userRole === 'cleaner') {
+    // Cleaner sees all customers who are "available" (you can define your logic)
+    return loc.role === 'customer' && loc.isAvailable !== false;
+  }
 
-    return false;
-  });
+  // VIEWER or other roles
+  return false;
+});
+
+
 
   const renderPopupContent = (loc) => {
-    const isSelf = loc.uid === user?.uid;
+    const isSelf = loc.sessionId === sessionId || loc.uid === user?.uid;
+
     const clientCanTrack = true; // simulate permission system for now
 
-    if (userRole === 'customer' && loc.role === 'cleaner' && clientCanTrack) {
-      return (
-      
-        <div className="user-card">
-          <div className="user-info">
-            <strong className="user-name">{loc.name || 'Cleaner'}</strong>
-            <div className="user-role">({loc.role})</div>
-          </div>
+if (userRole === 'customer' && loc.role === 'cleaner') {
+  const hasActiveRequest = currentRequestId || currentRequestKey;
 
-          <div className="user-actions">
-            <button
-              className="btn btn-primary"
-              onClick={() => {
-                setTargetCoords(loc);
-                setRecenterTrigger(prev => prev + 1);
-              }}
-            >
-              Track Cleaner
-            </button>
-            <button
-              className="btn btn-secondary"
-              onClick={() => handleOpenChat(loc.uid)}
-            >
-              Chat with Cleaner
-            </button>
-            <button
-              className="btn btn-secondary"
-              onClick={() => requestCleaner(loc.uid)}
-            >
-              Request
-            </button>
-          </div>
-        </div>
+  return (
+    <div className="user-card">
+      <div className="user-info">
+        <strong className="user-name">{loc.name || 'Cleaner'}</strong>
+        <div className="user-role">({loc.role})</div>
+      </div>
 
-      );
-    }
+      <div className="user-actions">
+        <button
+          className="btn btn-primary"
+          onClick={() => {
+            setTargetCoords(loc);
+            setRecenterTrigger(prev => prev + 1);
+          }}
+        >
+          Track Cleaner
+        </button>
+
+        <button
+          className="btn btn-secondary"
+          onClick={() => handleOpenChat(loc.uid)}
+        >
+          Chat with Cleaner
+        </button>
+
+        <button
+          className="btn btn-secondary"
+          disabled={hasActiveRequest}
+          onClick={() => {
+            if (hasActiveRequest) {
+              alert("⏳ You already have a pending or accepted request.");
+              return;
+            }
+            requestCleaner(loc.uid);
+            // Optional: close popup immediately
+            const popups = document.getElementsByClassName('leaflet-popup-close-button');
+            if (popups.length) popups[0].click();
+          }}
+        >
+          {hasActiveRequest ? "Request Sent" : "Request"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 
     // Don't show popup buttons for yourself
     if (isSelf) {
@@ -513,9 +584,7 @@ const handleOpenChat = (uid) => {
 };
 
 const requestCleaner = async (cleanerUid) => {
-  console.log("📞 requestCleaner called with cleanerUid:", cleanerUid);
-
-   if (!user?.uid || userRole !== 'customer') {
+  if (!user?.uid || userRole !== 'customer') {
     alert("Only customers can request cleaners.");
     return;
   }
@@ -523,13 +592,22 @@ const requestCleaner = async (cleanerUid) => {
   const requestRef = ref(database, `requests/${cleanerUid}`);
   await set(requestRef, {
     from: user.uid,
+    cleanerUid,      // 🔥 Save cleaner UID
     status: 'pending',
     timestamp: Date.now(),
   });
 
   console.log(`📩 Sent cleaning request from ${user.uid} to ${cleanerUid}`);
 
+  // store in state for UI
+  setCurrentCustomerRequest({
+    cleanerUid,
+    status: 'pending'
+  });
 };
+
+
+// ✅ Cleaner incoming request listener
 
 useEffect(() => {
   if (userRole !== 'cleaner' || !user?.uid) return;
@@ -538,50 +616,123 @@ useEffect(() => {
 
   const unsubscribe = onValue(requestRef, (snapshot) => {
     const data = snapshot.val();
-    if (data && data.status === 'pending') {
-      setIncomingRequest(data);
+
+    if (!data) {
+      // no request
+      setIncomingRequest(null);
+      return;
     }
+
+    // If request is pending -> show incomingRequest
+    if (data.status === 'pending') {
+      setIncomingRequest(data);
+      return;
+    }
+
+    // If status changed to accepted/rejected/cancelled and we are the cleaner:
+    if (data.status === 'cancelled') {
+      // if we had an activeJob for this customer, clear it
+      if (activeJob?.customerUid && activeJob.customerUid === data.from) {
+        setActiveJob(null);
+        setIsTrackingCustomer(false);
+        setCurrentRequestId(null);
+        setCurrentRequestKey(null);
+        setIsAvailable(true);
+        setCustomerNotice({ title: "Request cancelled", body: "Customer cancelled the request.", type: "error" });
+      }
+      setIncomingRequest(null);
+      return;
+    }
+
+    // If accepted by some other flow (shouldn't happen) --> keep logic defensive
+    if (data.status === 'accepted') {
+      // show an accepted state briefly (but cleaner accepted by themself through UI)
+      setIncomingRequest(data); // optional: show accepted state if needed
+      return;
+    }
+
+    // default: keep incomingRequest empty
+    setIncomingRequest(null);
   });
 
   return () => unsubscribe();
-}, [user?.uid, userRole]);
+}, [user?.uid, userRole, activeJob]);
+
 
 // ✅ Cleaner accepts request
+// ✅ Cleaner accepts request (REPLACED)
 const acceptRequest = async () => {
+  if (!incomingRequest?.from) {
+    alert("No request data available.");
+    return;
+  }
+
+  setIsProcessing(true);
+
   try {
-    const reqRef = ref(database, `requests/${user.uid}`);
-    await set(reqRef, { ...incomingRequest, status: 'accepted' });
+    const requestKey = user.uid; // path: requests/{cleanerUid}
+    const reqRef = ref(database, `requests/${requestKey}`);
 
-    const locRef = ref(database, `locations/${deviceId}`);
-    await set(locRef, {
-      ...currentCoords,
-      role: userRole,
-      name: userName,
-      uid: auth.currentUser?.uid || null,
-      isAvailable: false, // ✅ step 3: auto go offline after accepting
-      timestamp: Date.now(),
-      lat: currentCoords?.lat,
-      lng: currentCoords?.lng,
-    });
+    // mark RTDB request accepted so customer sees it immediately
+    await set(reqRef, { ...incomingRequest, status: 'accepted', acceptedAt: Date.now() });
 
-    // ✅ step 2: Create booking record in Firestore
-    const bookingRef = collection(db, 'bookings');
-    await addDoc(bookingRef, {
+    // ensure cleaner's location is saved and marked unavailable
+    if (sessionId) {
+      const locRef = ref(database, `locations/${sessionId}`);
+      await set(locRef, {
+        sessionId,
+        deviceId,
+        role: userRole,
+        name: userName,
+        uid: auth.currentUser?.uid || null,
+        isAvailable: false,
+        timestamp: Date.now(),
+        lat: currentCoords?.lat ?? null,
+        lng: currentCoords?.lng ?? null,
+      });
+    }
+
+    // create booking in Firestore and capture booking id
+    const bookingRef = await addDoc(collection(db, 'bookings'), {
       cleanerUid: user.uid,
       customerUid: incomingRequest.from,
       status: 'accepted',
       createdAt: serverTimestamp(),
     });
-    console.log("📘 Booking created in Firestore.");
 
-    // ✅ optional visual feedback
-    alert("🧹 Request accepted! Booking recorded.");
+    // Update local state to reflect active job
+    const job = {
+      cleanerUid: user.uid,
+      customerUid: incomingRequest.from,
+      bookingId: bookingRef.id,
+      status: 'accepted',
+      startedAt: Date.now(),
+    };
 
-    setIncomingRequest(null);
+    setActiveJob(job);
+    setCurrentRequestId(bookingRef.id);
+    setCurrentRequestKey(requestKey);
+    setIsTrackingCustomer(true);
+    setIsAvailable(false); // prevent toggle mistakes
+    setIncomingRequest(null); // close incoming request UI
+    setIsProcessing(false);
+
+    // small UI feedback
+    setCustomerNotice({
+      title: "You accepted the request",
+      body: "Tracking customer... show route on map.",
+      type: "success",
+    });
+
+    console.log("📘 Booking created in Firestore. id=", bookingRef.id);
   } catch (err) {
     console.error("❌ Error accepting request:", err);
+    setIsProcessing(false);
+    alert("Failed to accept request — check console.");
   }
 };
+
+
 
 // ✅ Customer feedback listener
 useEffect(() => {
@@ -592,43 +743,40 @@ useEffect(() => {
     const data = snapshot.val();
     if (!data) return;
 
-    // Find requests that this customer sent
     const myRequests = Object.entries(data).filter(
       ([, req]) => req.from === user.uid
     );
 
     if (myRequests.length > 0) {
       const [, latest] = myRequests[myRequests.length - 1];
-      console.log("📢 Cleaner response:", latest.status);
 
-      // ✅ popup notification instead of alert
-      if (Notification.permission === 'granted') {
-        if (latest.status === 'accepted') {
-          new Notification("✅ Cleaner Accepted", {
-            body: "Your cleaner is on the way!",
-          });
-        } else if (latest.status === 'rejected') {
-          new Notification("❌ Cleaner Rejected", {
-            body: "Cleaner declined your request. Try another one.",
-          });
-        }
-      } else {
-        // fallback alert if permission not granted
-        if (latest.status === 'accepted') {
-          alert("✅ Your request was accepted! Cleaner is on the way.");
-        } else if (latest.status === 'rejected') {
-          alert("❌ Your request was rejected. Try another cleaner.");
-        }
+      setCurrentCustomerRequest({
+        cleanerUid: latest.to || latest.cleanerUid || null,
+        status: latest.status
+      });
+
+      if (latest.status === 'accepted') {
+        setCustomerNotice({
+          title: "Cleaner Accepted Your Request",
+          body: "Your cleaner is on the way! 🚀",
+          type: "success",
+        });
+      } else if (latest.status === 'rejected') {
+        setCustomerNotice({
+          title: "Cleaner Rejected Your Request",
+          body: "Try requesting another cleaner.",
+          type: "error",
+        });
+        setCurrentCustomerRequest(null);
       }
+    } else {
+      setCurrentCustomerRequest(null);
     }
   });
 
-  // ✅ keep unsubscribe for cleanup
-  return () => {
-    unsubscribe();
-    console.log("🧹 Customer request listener unsubscribed.");
-  };
+  return () => unsubscribe();
 }, [userRole, user?.uid]);
+
 
 
 
@@ -660,51 +808,49 @@ const handleTrackCustomer = () => {
   }
 };
 
+// Place this inside your App component, **above the return()**
+const cancelCustomerRequest = async () => {
+  if (!currentCustomerRequest) {
+    alert("No active request to cancel.");
+    return;
+  }
 
-// const handleTrackCustomer = () => {
-//   console.log("🔍 Incoming request from UID:", incomingRequest?.from);
+  // fallback: try to get cleanerUid from RTDB path or Firestore booking
+  const cleanerUid = currentCustomerRequest.cleanerUid || currentRequestKey;
+  if (!cleanerUid) {
+    alert("Cannot find cleaner for this request.");
+    return;
+  }
 
+  try {
+    // Update Firebase Realtime Database
+    const reqRef = ref(database, `requests/${cleanerUid}`);
+    await set(reqRef, {
+      from: user.uid,
+      status: 'cancelled',
+      timestamp: Date.now(),
+    });
 
-//   if (!incomingRequest?.from || !allLocations) return;
+    // Update Firestore booking if exists
+    if (currentRequestId) {
+      await updateDoc(doc(db, "bookings", currentRequestId), {
+        status: 'cancelled',
+        updatedAt: serverTimestamp(),
+      });
+    }
 
-//   const customerEntry = Object.entries(allLocations).find(
-//     ([key, loc]) =>
-//       key === incomingRequest.from || loc.uid === incomingRequest.from
-//   );
+    // Clear local states so UI updates
+    setCurrentCustomerRequest(null);
+    setCurrentRequestId(null);
+    setCurrentRequestKey(null);
 
-//   if (customerEntry) {
-//     const [, customerLoc] = customerEntry;
-//     setTargetCoords({ lat: customerLoc.lat, lng: customerLoc.lng });
-//     setRecenterTrigger((prev) => prev + 1);
+    alert("❌ Your request was cancelled.");
+  } catch (err) {
+    console.error("❌ Error cancelling request:", err);
+    alert("❌ Failed to cancel request. Check console.");
+  }
+};
 
-//     console.log("📍 Tracking customer at:", customerLoc);
-//   } else {
-//     console.warn("⚠️ Could not find customer in allLocations:", incomingRequest.from);
-//     alert("Customer location not found.");
-//   }
-// };
-
-// const handleTrackCustomer = () => {
-//   if (!incomingRequest?.from || !allLocations) return;
-
-//   const customerLoc = Object.values(allLocations).find(
-//     (loc) => loc.uid === incomingRequest.from
-//   );
-
-//   if (customerLoc) {
-//     setTargetCoords({
-//       lat: customerLoc.lat,
-//       lng: customerLoc.lng,
-//     });
-//     setRecenterTrigger((prev) => prev + 1);
-
-//     console.log("📍 Tracking customer at:", customerLoc);
-//     console.log("🔍 Incoming request from UID:", incomingRequest?.from);
-
-//   } else {
-//     alert("Customer location not found.");
-//   }
-// };
 
 const rejectRequest = async () => {
   const reqRef = ref(database, `requests/${user.uid}`);
@@ -712,6 +858,123 @@ const rejectRequest = async () => {
 
   setIncomingRequest(null);
 };
+
+// Cleaner finishes the job
+const finishJob = async () => {
+  if (!activeJob?.bookingId || !activeJob?.customerUid) {
+    alert("No active job to finish.");
+    return;
+  }
+
+  setIsProcessing(true);
+  try {
+    // update Firestore booking
+    await updateDoc(doc(db, "bookings", activeJob.bookingId), {
+      status: 'completed',
+      updatedAt: serverTimestamp(),
+    });
+
+    // update RTDB request so customer gets instant update
+    if (currentRequestKey) {
+      const reqRef = ref(database, `requests/${currentRequestKey}`);
+      await set(reqRef, {
+        from: activeJob.customerUid,
+        status: 'completed',
+        timestamp: Date.now(),
+      });
+    }
+
+    // mark cleaner available again in locations
+    if (sessionId) {
+      const locRef = ref(database, `locations/${sessionId}`);
+      await set(locRef, {
+        sessionId,
+        deviceId,
+        role: userRole,
+        name: userName,
+        uid: auth.currentUser?.uid || null,
+        isAvailable: true,
+        timestamp: Date.now(),
+        lat: currentCoords?.lat ?? null,
+        lng: currentCoords?.lng ?? null,
+      });
+    }
+
+    // cleanup local state
+    setActiveJob(null);
+    setCurrentRequestId(null);
+    setCurrentRequestKey(null);
+    setIsTrackingCustomer(false);
+    setIsAvailable(true);
+    setIsProcessing(false);
+
+    setCustomerNotice({ title: "Job completed", body: "Thanks — job finished.", type: "success" });
+  } catch (err) {
+    console.error("❌ finishJob failed:", err);
+    setIsProcessing(false);
+    alert("Failed to complete job. Check console.");
+  }
+};
+
+// Cleaner cancels the active job (manual cancel)
+const cancelActiveJob = async (reason = 'cancelled_by_cleaner') => {
+  if (!activeJob?.customerUid) {
+    alert("No active job to cancel.");
+    return;
+  }
+
+  setIsProcessing(true);
+  try {
+    // mark RTDB request cancelled
+    if (currentRequestKey) {
+      const reqRef = ref(database, `requests/${currentRequestKey}`);
+      await set(reqRef, {
+        from: activeJob.customerUid,
+        status: 'cancelled',
+        reason,
+        timestamp: Date.now(),
+      });
+    }
+
+    // update Firestore if exists
+    if (activeJob.bookingId) {
+      await updateDoc(doc(db, "bookings", activeJob.bookingId), {
+        status: 'cancelled',
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    // mark cleaner available again in locations
+    if (sessionId) {
+      const locRef = ref(database, `locations/${sessionId}`);
+      await set(locRef, {
+        sessionId,
+        deviceId,
+        role: userRole,
+        name: userName,
+        uid: auth.currentUser?.uid || null,
+        isAvailable: true,
+        timestamp: Date.now(),
+        lat: currentCoords?.lat ?? null,
+        lng: currentCoords?.lng ?? null,
+      });
+    }
+
+    setActiveJob(null);
+    setCurrentRequestId(null);
+    setCurrentRequestKey(null);
+    setIsTrackingCustomer(false);
+    setIsAvailable(true);
+    setIsProcessing(false);
+
+    setCustomerNotice({ title: "Job cancelled", body: "You cancelled the job.", type: "error" });
+  } catch (err) {
+    console.error("❌ cancelActiveJob failed:", err);
+    setIsProcessing(false);
+    alert("Failed to cancel job. Check console.");
+  }
+};
+
 
 
   return (
@@ -735,19 +998,59 @@ const rejectRequest = async () => {
                 <button onClick={() => setCustomerNotice(null)}>OK</button>
               </div>
               )}
-
-            {/* Incoming Cleaner Request */}
-            {incomingRequest && (
-              <div className="notification request-notification">
-                <strong> New Cleaning Request</strong>
-                <p>Someone needs your services.</p>
-                <div>
-                  <button onClick={handleTrackCustomer} className="btn btn-info">Track Customer</button>
-                  <button onClick={acceptRequest} className="btn btn-success">Accept</button>
-                  <button onClick={rejectRequest} className="btn btn-danger">Reject</button>
-                </div>
+                        
+            {currentCustomerRequest && currentCustomerRequest.status !== 'completed' && (
+              <div className="notification request-status">
+                <strong>🧹 Your request is {currentCustomerRequest.status}</strong>
+                <button 
+                  className="btn btn-danger" 
+                  onClick={cancelCustomerRequest}
+                >
+                  Cancel Request
+                </button>
               </div>
             )}
+
+
+
+
+{/* Incoming Cleaner Request OR Active Job */}
+{activeJob ? (
+  <div className="notification job-active">
+    <strong>🔧 Job active</strong>
+    <p>Customer: {activeJob.customerUid}</p>
+    <div style={{ display: 'flex', gap: 8 }}>
+      <button className="btn btn-info" onClick={handleTrackCustomer} disabled={isProcessing}>
+        Track Customer
+      </button>
+      <button className="btn btn-success" onClick={finishJob} disabled={isProcessing}>
+        Finish Job
+      </button>
+      <button className="btn btn-danger" onClick={() => cancelActiveJob('cancelled_by_cleaner')} disabled={isProcessing}>
+        Cancel Job
+      </button>
+    </div>
+  </div>
+) : incomingRequest ? (
+  <div className="notification request-notification">
+    <strong> New Cleaning Request</strong>
+    <p>From: {incomingRequest.from}</p>
+    <div style={{ display: 'flex', gap: 8 }}>
+      <button onClick={handleTrackCustomer} className="btn btn-info" disabled={isProcessing}>Track Customer</button>
+      <button
+        className="btn btn-success"
+        onClick={async () => {
+          await acceptRequest();
+          // handleTrackCustomer() will pick up from activeJob via effect
+        }}
+        disabled={isProcessing}
+      >
+        {isProcessing ? "Accepting..." : "Accept"}
+      </button>
+      <button onClick={rejectRequest} className="btn btn-danger" disabled={isProcessing}>Reject</button>
+    </div>
+  </div>
+) : null}
 
             {Object.keys(unreadMessages).length > 0 && (
               <div className="notification message-alert">
@@ -780,7 +1083,7 @@ const rejectRequest = async () => {
             )} */}
           </div>
           {showRoleModal && (
-            <div className="modal-backdrop">
+            <div className="modal-backdrop bg-green-200">
               <div className="modal-content">
                 <h2>Welcome!</h2>
                 <p>Who are you?</p>
@@ -809,6 +1112,11 @@ const rejectRequest = async () => {
             {currentCoords && targetCoords && (
               <ManualRoute from={currentCoords} to={targetCoords} />
             )}
+
+            {isTrackingCustomer && customerCoords && currentCoords && (
+              <ManualRoute from={currentCoords} to={customerCoords} />
+            )}
+
 
             {/* ✅ Show marker for current device */}
             {currentCoords && (
@@ -861,8 +1169,8 @@ const rejectRequest = async () => {
                       loc.role
                     )}
                   >
-                    <Popup>
-                      {renderPopupContent(loc)} {/* ✅ OK */}
+                    <Popup autoClose={true}>
+                      {renderPopupContent(loc)}
                     </Popup>
 
                     {/* ✅ Show unread bubble if needed */}
@@ -889,111 +1197,78 @@ const rejectRequest = async () => {
         
         </div>
       </div>
-      <div className="control-panel">
-            <div className="panel-content">
-              <div className="search-form">
-               
-                <button
-                  onClick={async () => {
-                    if (sharing) {
-                      // 🧹 Stop sharing: remove location + reset flags
-                      if (deviceId) {
-                        await remove(ref(database, `locations/${deviceId}`));
-                        console.log(`🗑️ Removed location for ${deviceId}`);
-                      }
-                      setSharing(false);
-                      setIsAvailable(false);
-                      alert("🛑 You stopped sharing your location.");
-                    } else {
-                      setSharing(true);
-                      alert("✅ Location sharing started.");
-                    }
-                  }}
-                >
-                  {sharing ? 'Stop Sharing' : 'Start Sharing'}
-              </button>
-              </div>
+<div className="control-panel">
+  <div className="panel-content">
+    <div className="search-form">
+      <button
+        onClick={async () => {
+          if (sharing) {
+            // 🧹 Stop sharing: remove location + reset flags
+            if (deviceId || sessionId) {
+              await remove(ref(database, `locations/${sessionId || deviceId}`));
+            }
+            setSharing(false);
+            setIsAvailable(false);
+            alert("🛑 You stopped sharing your location.");
+          } else {
+            setSharing(true);
+            alert("✅ Location sharing started.");
+          }
+        }}
+      >
+        {sharing ? 'Stop Sharing' : 'Start Sharing'}
+      </button>
+    </div>
 
-              {/* <div className="mode-buttons">
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={sharing}
-                    onChange={() => setSharing(!sharing)}
-                  />
-                  Share My Location
-                </label>
-              </div> */}
+    {/* <div className="mode-buttons">
+      <label>
+        <input
+          type="checkbox"
+          checked={sharing}
+          onChange={() => setSharing(!sharing)}
+        />
+        Share My Location
+      </label>
+    </div> */}
 
-              {userRole === 'cleaner' && (
-                <div className="availability-toggle">
-                  <div className="toggle-row">
-                    <label className="switch">
-                      <input
-                        type="checkbox"
-                        checked={isAvailable}
-                        onChange={toggleAvailability}
-                      />
-                      <span className="slider"></span>
-                    </label>
-                    <span className={`status-text ${isAvailable ? 'online' : 'offline'}`}>
-                      {isAvailable ? ' Online' : ' Offline'}
-                    </span>
-                  </div>
-                </div>
-              )}
+    {/*
+      Fix: Wrapped JSX in parentheses and removed invalid 'customer' call.
+      Keeps the availability toggle for cleaners only.
+    */}
+    {userRole === 'cleaner' && (
+      <div className="availability-toggle">
+        <div className="toggle-row">
+          <label className="switch">
+          <input
+            type="checkbox"
+            checked={isAvailable}
+            onChange={toggleAvailability}
+            disabled={!!activeJob} // disable when on an active job
+          />
 
-              <div className="info-section">
-                {selectedRole === 'viewer' && (
-                  <p>You are viewing the map as a guest. No location access needed.</p>
-                )}
+            <span className="slider"></span>
+          </label>
+          <span className={`status-text ${isAvailable ? 'online' : 'offline'}`}>
+            {activeJob ? ' On Job' : (isAvailable ? ' Online' : ' Offline')}
+          </span>
 
-                {selectedRole && selectedRole !== 'viewer' && currentCoords && (
-                  <p><strong>Your location:</strong> {currentCoords.lat}, {currentCoords.lng}</p>
-                )}
-              </div>
-            
-          </div>
-                
-          </div>
-
-          
-
-
-      {/* {incomingMessage && (
-        <div style={{
-          zIndex: 1000,
-          position: 'absolute',
-          top: 20,
-          right: 20,
-          background: 'white',
-          border: '1px solid #ccc',
-          borderRadius: '8px',
-          padding: '1rem',
-          zIndex: 1000,
-          boxShadow: '0 4px 8px rgba(0,0,0,0.1)'
-        }}>
-          <strong>📨 New message</strong>
-          <p>{incomingMessage.text}</p>
-          <button
-            onClick={() => {
-              setChatWith(incomingMessage.senderId);
-              setIncomingMessage(null);
-            }}
-          >
-            Open Chat
-          </button>
         </div>
+      </div>
+    )}
+
+    <div className="info-section">
+      {selectedRole === 'viewer' && (
+        <p>You are viewing the map as a guest. No location access needed.</p>
       )}
 
-      {incomingRequest && (
-        <div className="modal">
-          <h3>New Request</h3>
-          <p>Customer is requesting your help</p>
-          <button onClick={acceptRequest}>Accept</button>
-          <button onClick={rejectRequest}>Reject</button>
-        </div>
-      )} */}
+      {selectedRole && selectedRole !== 'viewer' && currentCoords && (
+        <p>
+          <strong>Your location:</strong> {currentCoords.lat}, {currentCoords.lng}
+        </p>
+      )}
+    </div>
+  </div>
+</div>
 
       {chatWith && user?.uid && (
         <ChatBox
