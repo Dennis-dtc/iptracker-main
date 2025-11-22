@@ -1,6 +1,5 @@
-// src/userService.js
-// User management helpers for Firestore (works with Firebase Auth UIDs)
-import { firestore as db } from "./firebaseConfig";
+// src/services/userService.js
+import { firestore as db } from "../firebaseConfig";
 import {
   doc,
   setDoc,
@@ -15,21 +14,30 @@ import {
   arrayRemove
 } from "firebase/firestore";
 
-/**
- * createUserProfile
- * - Use Firebase Auth UID as the document id (recommended).
- * - If profile exists, this will merge new fields (safe for frontend-added fields).
- */
+// Allowed fields for updates
+const SAFE_USER_FIELDS = [
+  "name",
+  "email",
+  "phone",
+  "photoURL",
+  "category"
+];
+
+/** -------------------------------
+ * CREATE PROFILE
+ -------------------------------- */
 export async function createUserProfile({
   uid,
   name = "",
   email = "",
   phone = "",
-  role = "customer", // customer | cleaner | manager | admin
-  category = null,   // for cleaners: e.g. "house", "car", ...
+  role = "customer",
+  category = null,
+  photoURL = "",
   meta = {}
 }) {
-  if (!uid) throw new Error("uid is required (use Firebase Auth uid).");
+  if (!uid) throw new Error("uid required");
+
   const userRef = doc(db, "users", uid);
   const payload = {
     uid,
@@ -38,62 +46,57 @@ export async function createUserProfile({
     phone,
     role,
     category,
+    photoURL,
     rating: 0,
     ratingCount: 0,
-    status: "active", // active | busy | inactive
+    status: "active",
     createdAt: serverTimestamp(),
     meta
   };
-  await setDoc(userRef, payload, { merge: true }); // merge: true prevents overwriting unknown fields
-  return { id: uid, ...payload };
+
+  await setDoc(userRef, payload, { merge: true });
+  return payload;
 }
 
-/**
- * getUserById
- */
+/** -------------------------------
+ * GET PROFILE
+ -------------------------------- */
 export async function getUserById(uid) {
   if (!uid) return null;
-  const userRef = doc(db, "users", uid);
-  const snap = await getDoc(userRef);
-  if (!snap.exists()) return null;
-  return { id: snap.id, ...snap.data() };
+  const snap = await getDoc(doc(db, "users", uid));
+  return snap.exists() ? { id: snap.id, ...snap.data() } : null;
 }
 
-/**
- * updateUser
- * - Accepts partial data object to update
- */
+/** -------------------------------
+ * UPDATE PROFILE (SAFE PATCH)
+ -------------------------------- */
 export async function updateUser(uid, data = {}) {
-  if (!uid) throw new Error("uid is required");
+  if (!uid) throw new Error("uid required");
+
   const userRef = doc(db, "users", uid);
-  await updateDoc(userRef, { ...data, updatedAt: serverTimestamp() });
+
+  // only allow certain fields, ignore the rest
+  const cleanPatch = {};
+  for (const key of SAFE_USER_FIELDS) {
+    if (data[key] !== undefined) {
+      cleanPatch[key] = data[key];
+    }
+  }
+
+  cleanPatch.updatedAt = serverTimestamp();
+
+  await updateDoc(userRef, cleanPatch);
   return true;
 }
 
-/**
- * setUserRole
- */
-export async function setUserRole(uid, role) {
-  if (!uid) throw new Error("uid is required");
-  await updateUser(uid, { role });
-}
-
-/**
- * getUsersByRole
- * - e.g. getUsersByRole('cleaner')
- */
+/** ------------------------------- */
 export async function getUsersByRole(role) {
   const q = query(collection(db, "users"), where("role", "==", role));
   const snap = await getDocs(q);
-  const arr = [];
-  snap.forEach((d) => arr.push({ id: d.id, ...d.data() }));
-  return arr;
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 }
 
-/**
- * getCleanersByCategory
- * - e.g. category = "house"
- */
+/** ------------------------------- */
 export async function getCleanersByCategory(category) {
   const q = query(
     collection(db, "users"),
@@ -101,49 +104,48 @@ export async function getCleanersByCategory(category) {
     where("category", "==", category)
   );
   const snap = await getDocs(q);
-  const arr = [];
-  snap.forEach((d) => arr.push({ id: d.id, ...d.data() }));
-  return arr;
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 }
 
-/**
- * assignCleanerToManager
- * - Adds a cleaner id to manager.managedCleaners (array) and sets cleaner.managerId
- */
+/** ------------------------------- */
 export async function assignCleanerToManager(managerId, cleanerId) {
-  if (!managerId || !cleanerId) throw new Error("managerId and cleanerId required");
   const managerRef = doc(db, "users", managerId);
   const cleanerRef = doc(db, "users", cleanerId);
+
   await updateDoc(managerRef, { managedCleaners: arrayUnion(cleanerId) });
   await updateDoc(cleanerRef, { managerId });
+
   return true;
 }
 
-/**
- * removeCleanerFromManager
- */
+/** ------------------------------- */
 export async function removeCleanerFromManager(managerId, cleanerId) {
   const managerRef = doc(db, "users", managerId);
   const cleanerRef = doc(db, "users", cleanerId);
+
   await updateDoc(managerRef, { managedCleaners: arrayRemove(cleanerId) });
   await updateDoc(cleanerRef, { managerId: null });
+
   return true;
 }
 
-/**
- * addRatingToCleaner
- * - Updates cleaner.rating (running average) and ratingCount
- */
+/** ------------------------------- */
 export async function addRatingToCleaner(cleanerId, score) {
-  if (!cleanerId) throw new Error("cleanerId required");
   const cleanerRef = doc(db, "users", cleanerId);
   const snap = await getDoc(cleanerRef);
+
   if (!snap.exists()) throw new Error("Cleaner not found");
+
   const data = snap.data();
   const prevAvg = data.rating || 0;
   const prevCount = data.ratingCount || 0;
   const newCount = prevCount + 1;
   const newAvg = (prevAvg * prevCount + score) / newCount;
-  await updateDoc(cleanerRef, { rating: newAvg, ratingCount: newCount });
+
+  await updateDoc(cleanerRef, {
+    rating: newAvg,
+    ratingCount: newCount
+  });
+
   return { rating: newAvg, ratingCount: newCount };
 }

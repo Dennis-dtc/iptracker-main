@@ -1,7 +1,9 @@
 import { initializeApp } from 'firebase/app';
 import { getFirestore } from 'firebase/firestore';
-import { getAuth, signInAnonymously} from 'firebase/auth';
-import { getDatabase, ref, set, onValue } from 'firebase/database';
+import { getAuth, signInAnonymously } from 'firebase/auth';
+import { getDatabase, ref, set, onValue, remove } from 'firebase/database';
+import { getStorage } from 'firebase/storage'; // ✅ Add storage import
+
 
 const firebaseConfig = {
   apiKey: "AIzaSyCNpSMB5Myw7v5UeNP5L-Qc5RzE8TYzY_8",
@@ -17,8 +19,10 @@ const app = initializeApp(firebaseConfig);
 const database = getDatabase(app);
 const firestore = getFirestore(app);
 const auth = getAuth(app);
+const storage = getStorage(app); // ✅ Add storage export
 
-export { database, app , firestore, auth, signInAnonymously, ref, set, onValue };
+export { database, app, firestore, auth, storage, signInAnonymously, ref, set, onValue, remove };
+
 
 
 // // Import the functions you need from the SDKs you need

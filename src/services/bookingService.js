@@ -1,5 +1,5 @@
 // src/bookingService.js
-import { firestore as db } from "./firebaseConfig";
+import { firestore as db } from "../firebaseConfig";
 import { collection, addDoc, getDocs, serverTimestamp, doc, updateDoc } from "firebase/firestore";
 
 /**

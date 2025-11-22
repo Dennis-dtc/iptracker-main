@@ -1,5 +1,5 @@
 // src/ratingService.js
-import { firestore as db } from "./firebaseConfig";
+import { firestore as db } from "../firebaseConfig";
 import {
   collection,
   addDoc,
