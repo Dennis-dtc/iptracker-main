@@ -118,3 +118,37 @@ export async function completeBooking(bookingId) {
     console.error("❌ Error completing booking:", error);
   }
 }
+
+
+// Get bookings grouped by day of the week
+export async function getWeeklyBookingStats() {
+  const snapshot = await getDocs(collection(db, "bookings"));
+
+  // Initialize array for Sun–Sat
+  const daily = [0, 0, 0, 0, 0, 0, 0];
+  snapshot.forEach((doc) => {
+    const data = doc.data();
+    if (!data.createdAt) return;
+    const day = data.createdAt.toDate().getDay(); // 0–6
+    daily[day] += 1;
+  });
+
+  return daily;
+}
+
+// Get earnings per day of week
+export async function getWeeklyEarningsStats() {
+  const snapshot = await getDocs(collection(db, "payments"));
+
+  const earnings = [0, 0, 0, 0, 0, 0, 0];
+  snapshot.forEach((doc) => {
+    const data = doc.data();
+    if (!data.createdAt || !data.amount) return;
+
+    const day = data.createdAt.toDate().getDay();
+    earnings[day] += data.amount;
+  });
+
+  return earnings;
+}
+

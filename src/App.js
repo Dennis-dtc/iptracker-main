@@ -6,6 +6,7 @@ import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import ManualRoute from './ManualRoute';
 import ProfileForm from './components/profileform';
+import DashBoard from './dashboard';
 import ChatBox from './ChatBox';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -22,11 +23,22 @@ import { auth, signInAnonymously } from './firebaseConfig';
 import { onAuthStateChanged } from 'firebase/auth';
 import { firestore as db } from './firebaseConfig';
 
-// Firestore helpers & services (you uploaded these files)
-import { createBooking, processPayment, completeBooking, updateBookingStatus } from './services/bookingService';
-import { addRating as addRatingService } from './services/ratingService';
-import { getUserById, createUserProfile, updateUser } from './services/userService';
-import { addDoc, serverTimestamp, updateDoc, doc, collection, getDoc } from 'firebase/firestore';
+// Firestore helpers & services
+import { createBooking, updateBookingStatus } from './services/bookingService';
+import { getUserById } from './services/userService';
+import {
+  addDoc,
+  serverTimestamp,
+  updateDoc,
+  doc,
+  collection,
+  getDoc,
+  getDocs,
+  query,
+  where,
+  onSnapshot,
+  orderBy
+} from 'firebase/firestore';
 
 // Leaflet icon helpers
 const createRoleIcon = (imageUrl, role = 'cleaner') =>
@@ -55,6 +67,12 @@ L.Icon.Default.mergeOptions({
   iconUrl: require('leaflet/dist/images/marker-icon.png'),
   shadowUrl: require('leaflet/dist/images/marker-shadow.png'),
 });
+
+// deterministic conversation id helper
+const generateConversationId = (a, b) => {
+  if (!a || !b) return null;
+  return [a, b].sort().join('_');
+};
 
 // Recenter hook component
 function RecenterMap({ coords, trigger }) {
@@ -85,6 +103,7 @@ function App() {
   const [userProfile, setUserProfile] = useState(null); // fetched Firestore profile
   const [showRoleModal, setShowRoleModal] = useState(true);
   const [showProfileModal, setShowProfileModal] = useState(false);
+  const [ShowDashboardModal, setShowDashboardModal] = useState(false);
 
   /* -----------------------------
      SECTION 2 — Geolocation & RTDB
@@ -99,7 +118,7 @@ function App() {
      ----------------------------- */
   const [incomingRequest, setIncomingRequest] = useState(null); // for cleaners (requests/{cleanerUid})
   const [currentCustomerRequest, setCurrentCustomerRequest] = useState(null); // for customers (their outgoing request)
-  const [activeJob, setActiveJob] = useState(null); // { cleanerUid, customerUid, bookingId, status }
+  const [activeJob, setActiveJob] = useState(null); // { cleanerUid, customerUid, bookingId, status, customerName, cleanerName }
   const [isAvailable, setIsAvailable] = useState(true); // cleaner availability
   const [isProcessing, setIsProcessing] = useState(false);
   const [currentRequestKey, setCurrentRequestKey] = useState(null); // path key for requests (usually cleaner uid or session)
@@ -131,6 +150,12 @@ function App() {
   const [ratingComment, setRatingComment] = useState('');
 
   /* -----------------------------
+     Cleaner profile panel
+     ----------------------------- */
+  const [showCleanerProfilePanel, setShowCleanerProfilePanel] = useState(false);
+  const [cleanerProfile, setCleanerProfile] = useState(null);
+
+  /* -----------------------------
      SECTION 6 — Helpers / refs
      ----------------------------- */
   const [customerNotice, setCustomerNotice] = useState(null);
@@ -139,6 +164,7 @@ function App() {
   useEffect(() => {
     return () => { mountedRef.current = false; };
   }, []);
+  
 
   /* -----------------------------
      AUTH: anonymous sign-in & store auth user
@@ -304,12 +330,18 @@ function App() {
       setShowProfileModal(true);
       return alert('Please create your profile (name) before requesting a cleaner.');
     }
+    
+    if (!profile || !profile.name) {
+      setShowDashboardModal(true);
+      return alert('Please create your Admin profile (name) before proceeding to Dashboard.');
+    }
 
     // write RTDB request: path requests/{cleanerUidOrSession}
     try {
       const reqPath = `requests/${cleanerUidOrSession}`;
       await rtdbSet(rtdbRef(database, reqPath), {
         from: user.uid,
+        fromName: profile.name,
         to: cleanerUidOrSession,
         customerName: profile.name,
         status: 'pending',
@@ -318,7 +350,7 @@ function App() {
 
       // save the key so we can later update that exact RTDB path
       setCurrentRequestKey(cleanerUidOrSession);
-      setCurrentCustomerRequest({ cleanerUid: cleanerUidOrSession, status: 'pending' });
+      setCurrentCustomerRequest({ cleanerUid: cleanerUidOrSession, cleanerName: null, status: 'pending' });
       setCustomerNotice({ title: 'Request sent', body: 'Waiting for cleaner response', type: 'info' });
     } catch (err) {
       console.error('requestCleaner error', err);
@@ -342,12 +374,16 @@ function App() {
         return;
       }
       const [, latest] = my[my.length - 1];
-      setCurrentCustomerRequest({ cleanerUid: latest.to || latest.cleanerUid, status: latest.status });
+
+      // prefer cleanerName if present
+      const cleanerIdOrSession = latest.to || latest.cleanerUid;
+      const cleanerNameFromRTDB = latest.cleanerName || latest.toName || null;
+
+      setCurrentCustomerRequest({ cleanerUid: cleanerIdOrSession, cleanerName: cleanerNameFromRTDB, status: latest.status });
 
       // show notices & special transitions
       if (latest.status === 'accepted') {
-        setCustomerNotice({ title: 'Cleaner Accepted', body: 'Cleaner is on the way', type: 'success' });
-        // ensure we keep mapping the current request key
+        setCustomerNotice({ title: 'Cleaner Accepted', body: `Cleaner ${latest.cleanerName || latest.toName || ''} is on the way`, type: 'success' });
         setCurrentRequestKey(latest.to || latest.cleanerUid || currentRequestKey);
       }
       if (latest.status === 'rejected') {
@@ -363,7 +399,7 @@ function App() {
         if (latest.bookingId) {
           setPaymentBookingId(latest.bookingId);
         }
-        // show payment modal
+        // show payment modal (receipt will be shown inside)
         setShowPaymentModal(true);
       }
 
@@ -424,10 +460,6 @@ function App() {
 
   /* -----------------------------
      Cleaner: Accept Request
-     - marks RTDB request status accepted
-     - writes booking document in Firestore (createBooking)
-     - marks cleaner location isAvailable=false
-     - updates local activeJob
      ----------------------------- */
   const acceptRequest = async () => {
     if (!incomingRequest || !user?.uid) return alert('No incoming request');
@@ -435,11 +467,17 @@ function App() {
     try {
       // 1) mark RTDB request accepted (so customer sees fast)
       const reqRefPath = `requests/${user.uid}`;
+
+      // prefer customerName from incomingRequest
+      const customerName = incomingRequest.customerName || incomingRequest.fromName || null;
+
       const acceptedPayload = {
         ...incomingRequest,
         status: 'accepted',
         acceptedAt: Date.now(),
         cleanerUid: user.uid,
+        cleanerName: userName || '',
+        customerName: customerName || '',
       };
       await rtdbSet(rtdbRef(database, reqRefPath), acceptedPayload);
 
@@ -464,7 +502,7 @@ function App() {
 
       // 3) create booking in Firestore (we use your bookingService)
       const customerId = incomingRequest.from;
-      const bookingId = await createBooking({
+      const bookingResult = await createBooking({
         customerId,
         cleanerId: user.uid,
         serviceType: 'standard',
@@ -472,16 +510,34 @@ function App() {
         price: 0,
       });
 
-      // 4) update RTDB request with bookingId
+      // createBooking may return id or docRef
+      const bookingId = (bookingResult && bookingResult.id) ? bookingResult.id : bookingResult;
+
+      // 4) update Firestore booking with names (best-effort)
+      try {
+        if (bookingId) {
+          await updateDoc(doc(db, 'bookings', bookingId), {
+            cleanerName: userName || '',
+            customerName: incomingRequest.customerName || incomingRequest.fromName || '',
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch (e) {
+        console.warn('Could not append names to booking', e);
+      }
+
+      // 5) update RTDB request with bookingId
       await rtdbSet(rtdbRef(database, reqRefPath), {
         ...acceptedPayload,
         bookingId,
       });
 
-      // 5) update local active job
+      // 6) update local active job
       setActiveJob({
         cleanerUid: user.uid,
+        cleanerName: userName || '',
         customerUid: customerId,
+        customerName: incomingRequest.customerName || incomingRequest.fromName || '',
         bookingId,
         status: 'accepted',
         startedAt: Date.now(),
@@ -524,9 +580,7 @@ function App() {
   };
 
   /* -----------------------------
-     Cleaner: Finish Job (marks booking completed; client triggers payment flow on customer)
-     - Updates Firestore booking status to 'completed'
-     - Updates RTDB request status to 'waiting_for_payment' (so customer sees payment modal)
+     Cleaner: Finish Job
      ----------------------------- */
   const finishJob = async () => {
     if (!activeJob?.bookingId || !activeJob?.customerUid) {
@@ -542,7 +596,10 @@ function App() {
         const reqPath = `requests/${activeJob.cleanerUid}`;
         await rtdbSet(rtdbRef(database, reqPath), {
           from: activeJob.customerUid,
+          fromName: activeJob.customerName || '',
           to: activeJob.cleanerUid,
+          cleanerName: activeJob.cleanerName || '',
+          customerName: activeJob.customerName || '',
           status: "waiting_for_payment",
           bookingId: activeJob.bookingId,
           timestamp: Date.now(),
@@ -571,6 +628,7 @@ function App() {
       if (activeJob.cleanerUid) {
         await rtdbSet(rtdbRef(database, `requests/${activeJob.cleanerUid}`), {
           from: activeJob.customerUid,
+          fromName: activeJob.customerName || '',
           status: 'cancelled',
           reason,
           timestamp: Date.now(),
@@ -614,6 +672,7 @@ function App() {
       const cleanerUid = currentCustomerRequest.cleanerUid;
       await rtdbSet(rtdbRef(database, `requests/${cleanerUid}`), {
         from: user.uid,
+        fromName: userName || '',
         status: 'cancelled',
         timestamp: Date.now(),
       });
@@ -672,7 +731,6 @@ function App() {
     win.document.open();
     win.document.write(html);
     win.document.close();
-    // Give browser a moment to render then call print
     setTimeout(() => {
       win.print();
     }, 300);
@@ -680,9 +738,6 @@ function App() {
 
   /* -----------------------------
      Customer: Payment (demo)
-     - Customer fills amount manually (you chose option 3)
-     - After pay: mark booking paid (Firestore) + rtdb request.status = 'paid'
-     - then open rating (and set ratingBookingContext with cleanerId)
      ----------------------------- */
   const submitPayment = async () => {
     if (!paymentAmount || isProcessing) return;
@@ -700,19 +755,18 @@ function App() {
       }
 
       // 2. Update RTDB request for instant cleaner feedback
-      // currentRequestKey usually holds cleaner uid (requests/{cleanerUid})
-      if (currentRequestKey && activeJob?.customerUid) {
-        await rtdbSet(rtdbRef(database, `requests/${currentRequestKey}`), {
-          from: activeJob.customerUid,
-          status: "paid",
-          amount: paymentAmount,
-          bookingId: bookingId,
-          timestamp: Date.now(),
-        });
-      } else if (currentCustomerRequest?.cleanerUid) {
-        // fallback safe write
-        await rtdbSet(rtdbRef(database, `requests/${currentCustomerRequest.cleanerUid}`), {
-          from: user.uid,
+      const cleanerPath = currentRequestKey || currentCustomerRequest?.cleanerUid || activeJob?.cleanerUid;
+      const customerId = user.uid;
+      const customerNameToUse = userName || (userProfile && userProfile.name) || 'Customer';
+      const cleanerNameToUse = activeJob?.cleanerName || currentCustomerRequest?.cleanerName || '';
+
+      if (cleanerPath) {
+        await rtdbSet(rtdbRef(database, `requests/${cleanerPath}`), {
+          from: customerId,
+          fromName: customerNameToUse,
+          to: cleanerPath,
+          cleanerName: cleanerNameToUse,
+          customerName: customerNameToUse,
           status: "paid",
           amount: paymentAmount,
           bookingId: bookingId,
@@ -728,9 +782,34 @@ function App() {
       };
       setPaymentReceipt(receipt);
 
-      // 4. Resolve cleanerId for rating context
-      let cleanerId = currentRequestKey || currentCustomerRequest?.cleanerUid || activeJob?.cleanerUid;
-      // If still missing, try to read booking doc to find cleanerId
+      // 4. Write receipts + payments to Firestore for records
+      try {
+        const receiptDoc = await addDoc(collection(db, 'receipts'), {
+          receiptId: receipt.id,
+          bookingId: bookingId || null,
+          cleanerId: activeJob?.cleanerUid || null,
+          cleanerName: cleanerNameToUse,
+          customerId,
+          customerName: customerNameToUse,
+          amount: paymentAmount,
+          createdAt: serverTimestamp(),
+        });
+
+        // also create a simple payments record
+        await addDoc(collection(db, 'payments'), {
+          receiptRef: receiptDoc.id,
+          bookingId: bookingId || null,
+          amount: paymentAmount,
+          payerId: customerId,
+          payeeId: activeJob?.cleanerUid || null,
+          createdAt: serverTimestamp(),
+        });
+      } catch (e) {
+        console.warn('Failed to write receipt/payment to Firestore', e);
+      }
+
+      // 5. Resolve cleanerId for rating context (store even if null)
+      let cleanerId = activeJob?.cleanerUid || currentCustomerRequest?.cleanerUid || currentRequestKey;
       if (!cleanerId && bookingId) {
         try {
           const bDoc = await getDoc(doc(db, 'bookings', bookingId));
@@ -743,23 +822,20 @@ function App() {
         }
       }
 
-      // 5. Set rating context using resolved values (ensure cleanerId present)
+      // 6. Set rating context using resolved values
       setRatingBookingContext({
         bookingId: bookingId,
         cleanerId: cleanerId || null,
       });
 
-      // open rating modal only if we have booking id and cleaner id or at least booking id
-      setShowPaymentModal(false);
-      setShowRatingModal(true);
+      // show payment modal (receipt visible)
+      setShowPaymentModal(true);
 
-      // clear customer-side request so cancel button disappears
+      // clear customer-side request UI (so cancel button disappears)
       setCurrentCustomerRequest(null);
       setCurrentRequestId(bookingId || null);
       setCurrentRequestKey(null);
 
-      // Optionally offer print immediately (customer flow)
-      // We'll not auto-print, but show receipt on UI with print button in Payment modal area
     } catch (err) {
       console.error("❌ submitPayment() error:", err);
       alert("Payment failed. Check console.");
@@ -771,12 +847,10 @@ function App() {
 
   /* -----------------------------
      Rating: 1-5 stars
-     - saves rating, marks booking closed, removes RTDB request and resets states
      ----------------------------- */
   const submitRating = async (value = ratingValue, comment = ratingComment) => {
     if (isProcessing || !value) return;
 
-    // Extract booking ID and cleaner ID safely BEFORE anything else
     const bookingId =
       ratingBookingContext?.bookingId ||
       activeJob?.bookingId ||
@@ -787,7 +861,6 @@ function App() {
       activeJob?.cleanerUid ||
       currentRequestKey;
 
-    // If cleanerId is still missing, try to read it from booking doc
     if (!cleanerId && bookingId) {
       try {
         const bDoc = await getDoc(doc(db, 'bookings', bookingId));
@@ -801,7 +874,7 @@ function App() {
     }
 
     if (!bookingId || !cleanerId) {
-      console.error("Rating aborted: missing bookingId or cleanerId", { bookingId, cleanerId, ratingBookingContext, activeJob, currentRequestKey });
+      console.error("Rating aborted: missing bookingId or cleanerId", { bookingId, cleanerId });
       alert("Cannot submit rating: missing booking or cleaner information.");
       return;
     }
@@ -833,7 +906,45 @@ function App() {
         if (currentRequestKey) await rtdbRemove(rtdbRef(database, `requests/${currentRequestKey}`));
       } catch (e) { /* ignore */ }
 
-      // 4. Reset cleaner availability if this client is the cleaner
+      // 4. Compute aggregate rating (avg + count) from ratings collection for this cleaner
+      try {
+        const ratingsQ = query(collection(db, 'ratings'), where('cleanerUid', '==', cleanerId));
+        const snap = await getDocs(ratingsQ);
+        let sum = 0;
+        let cnt = 0;
+        snap.forEach(docSnap => {
+          const d = docSnap.data();
+          if (d && typeof d.rating === 'number') {
+            sum += d.rating;
+            cnt += 1;
+          } else if (d && !isNaN(Number(d.rating))) {
+            sum += Number(d.rating);
+            cnt += 1;
+          }
+        });
+        const avg = cnt ? (sum / cnt) : 0;
+
+        // update cleaner user doc with aggregated stats and increment completedJobs (Option A)
+        try {
+          const userRef = doc(db, 'users', cleanerId);
+          const userDoc = await getDoc(userRef);
+          const prevCompleted = userDoc.exists() ? (userDoc.data().completedJobs || 0) : 0;
+          const newCompleted = prevCompleted + 1;
+
+          await updateDoc(userRef, {
+            averageRating: avg,
+            ratingCount: cnt,
+            completedJobs: newCompleted,
+            lastRatedAt: serverTimestamp()
+          });
+        } catch (uErr) {
+          console.warn('Failed to update cleaner user doc with aggregates', uErr);
+        }
+      } catch (aggErr) {
+        console.warn('Failed to compute rating aggregate', aggErr);
+      }
+
+      // 5. Reset cleaner availability if this client is the cleaner
       if (sessionId && userRole === "cleaner") {
         await rtdbSet(rtdbRef(database, `locations/${sessionId}`), {
           sessionId,
@@ -848,7 +959,7 @@ function App() {
         });
       }
 
-      // 5. Reset UI state
+      // 6. Reset UI state
       setActiveJob(null);
       setCurrentRequestId(null);
       setCurrentRequestKey(null);
@@ -872,6 +983,55 @@ function App() {
   };
 
   /* -----------------------------
+     View Cleaner Profile helper (loads profile + aggregates)
+     ----------------------------- */
+ const viewCleanerProfile = async (cleanerUid) => {
+  if (!cleanerUid) return alert('Cleaner profile not available');
+
+  setCleanerProfile(null); // show loading
+  setShowCleanerProfilePanel(true); // open modal immediately
+
+  try {
+    const prof = await getUserById(cleanerUid);
+    // compute ratings
+    let avg = 0, count = 0;
+    try {
+      const ratingsQ = query(collection(db, 'ratings'), where('cleanerUid', '==', cleanerUid));
+      const snap = await getDocs(ratingsQ);
+      let sum = 0, cnt = 0;
+      snap.forEach(s => {
+        const d = s.data();
+        if (d && typeof d.rating === 'number') { sum += d.rating; cnt += 1; }
+        else if (d && !isNaN(Number(d.rating))) { sum += Number(d.rating); cnt += 1; }
+      });
+      avg = cnt ? (sum / cnt) : 0;
+      count = cnt;
+    } catch (e) { console.warn(e); }
+
+    setCleanerProfile({
+      uid: cleanerUid,
+      name: prof?.name || 'Anonymous cleaner',
+      avgRating: avg,
+      ratingCount: count,
+      completedJobs: prof?.completedJobs || 0,
+      bio: prof?.bio || ''
+    });
+
+  } catch (e) {
+    console.error(e);
+    setCleanerProfile({
+      uid: cleanerUid,
+      name: 'Cleaner',
+      avgRating: 0,
+      ratingCount: 0,
+      completedJobs: 0,
+      bio: ''
+    });
+  }
+};
+
+
+  /* -----------------------------
      Render popup JSX
      ----------------------------- */
   function renderPopupContentJSX(loc) {
@@ -885,12 +1045,23 @@ function App() {
     }
 
     if (userRole === 'customer' && loc.role === 'cleaner') {
-      const hasActiveRequest = currentCustomerRequest && (currentCustomerRequest.cleanerUid === loc.uid || currentCustomerRequest.cleanerUid === loc.sessionId);
+      const hasActiveRequest =
+        currentCustomerRequest &&
+        (currentCustomerRequest.cleanerUid === loc.uid ||
+         currentCustomerRequest.cleanerUid === loc.sessionId);
+
       return (
         <div>
           <strong>Cleaner</strong>
           <div>{loc.name || 'Cleaner'}</div>
-          <div style={{ marginTop: 8 }}>
+          <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+            <button
+              className="btn btn-outline"
+              onClick={() => viewCleanerProfile(loc.uid || loc.sessionId)}
+            >
+              View Cleaner Profile
+            </button>
+
             <button
               className="btn btn-primary"
               onClick={() => requestCleaner(loc.uid || loc.sessionId)}
@@ -904,16 +1075,18 @@ function App() {
     }
 
     if (userRole === 'cleaner' && loc.role === 'customer') {
-      // cleaner views customer: allow "View Request" if one exists
       return (
         <div>
           <strong>Customer</strong>
           <div>{loc.name || 'Customer'}</div>
           <div style={{ marginTop: 8 }}>
-            <button className="btn btn-success" onClick={() => {
-              setIncomingRequest(null);
-              alert('Tap Accept in the incoming request panel to accept this customer (server-synced).');
-            }}>
+            <button
+              className="btn btn-success"
+              onClick={() => {
+                setIncomingRequest(null);
+                alert('Tap Accept in the incoming request panel.');
+              }}
+            >
               View Request
             </button>
           </div>
@@ -925,11 +1098,10 @@ function App() {
   }
 
   /* -----------------------------
-     Small UI helpers
+     UI helpers
      ----------------------------- */
   const toggleSharing = async () => {
     if (sharing) {
-      // stop: remove location then stop watch
       if (sessionId) {
         await rtdbRemove(rtdbRef(database, `locations/${sessionId}`)).catch(() => {});
       }
@@ -943,275 +1115,640 @@ function App() {
 
   const openProfileModal = () => setShowProfileModal(true);
 
+  const renderStars = (avg) => {
+    const n = Math.round(avg);
+    const filled = '★'.repeat(n);
+    const empty = '☆'.repeat(5 - n);
+    return (
+      <span style={{ color: '#f59e0b', fontSize: 16 }}>
+        {filled}{empty}
+      </span>
+    );
+  };
+
+  /* -----------------------------
+     Realtime messages listener (instant delivery)
+     - listens to same conversation subcollection used by ChatBox
+     ----------------------------- */
+  useEffect(() => {
+    if (!user?.uid || !chatWith) return;
+
+    const conversationId = generateConversationId(user.uid, chatWith);
+    if (!conversationId) return;
+
+    const messagesRef = collection(db, "conversations", conversationId, "messages");
+    const q = query(messagesRef, orderBy("timestamp", "desc"));
+
+    const unsub = onSnapshot(q, (snapshot) => {
+      if (!snapshot.empty) {
+        const latest = snapshot.docs[0].data();
+
+        // Skip notifications when the latest message is from current user
+        if (latest.senderId !== user.uid) {
+          setIncomingMessage({
+            text: latest.text,
+            senderId: latest.senderId,
+            conversationId,
+          });
+
+          setUnreadMessages((prev) => ({
+            ...prev,
+            [latest.senderId]: true,
+          }));
+        }
+      }
+    });
+
+    return () => unsub();
+  }, [user?.uid, chatWith]);
+
+  /* -----------------------------
+     CHAT PANEL LAYOUT LOGIC (NEW)
+     ----------------------------- */
+  const chatPanelWidth = chatWith ? 320 : 0;
+
+  const mainGridStyle = {
+    display: 'grid',
+    gridTemplateColumns: `380px 1fr ${chatPanelWidth}px`,
+    gap: '1rem',
+    width: '95%',
+    height: '750px',
+    margin: '1rem auto',
+    transition: 'grid-template-columns 0.30s ease',
+  };
+
   /* -----------------------------
      Main render
      ----------------------------- */
   return (
-    <div className="App min-h-screen bg-black-50 p-4">
-      <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left column: Notifications / Controls */}
-        <div className="col-span-1 space-y-4">
+    <div className="App m-0 bg-black-50">
+
+      {/* MAIN LAYOUT GRID */}
+      <div style={mainGridStyle}>
+
+        {/* LEFT PANEL */}
+        <div className="max-height: 97vh space-y-4 relative">
+
+          {/* SESSION BOX */}
           <div className="p-4 bg-white rounded shadow">
             <h2 className="text-lg font-semibold">Session</h2>
             {!userRole && showRoleModal && (
               <div className="mt-4">
                 <p className="mb-2">Who are you?</p>
                 <div className="flex gap-2">
-                  <button className="px-3 py-2 bg-gray-200 rounded" onClick={() => handleRoleSelect('viewer')}>Viewer</button>
-                  <button className="px-3 py-2 bg-green-500 text-white rounded" onClick={() => handleRoleSelect('cleaner')}>Cleaner</button>
-                  <button className="px-3 py-2 bg-blue-500 text-white rounded" onClick={() => handleRoleSelect('customer')}>Customer</button>
-                </div>
+                  <button className="px-3 py-2 bg-gray-200 rounded"
+                          onClick={() => handleRoleSelect('viewer')}>
+                    Viewer
+                  </button>
+                  <button className="px-3 py-2 bg-green-500 text-white rounded"
+                          onClick={() => handleRoleSelect('cleaner')}>
+                    Cleaner
+                  </button>
+                  <button className="px-3 py-2 bg-blue-500 text-white rounded"
+                          onClick={() => handleRoleSelect('customer')}>
+                    Customer
+                  </button>
+                </div>  
               </div>
             )}
 
             <div className="mt-4">
-              <button className="px-3 py-2 bg-indigo-600 text-white rounded" onClick={toggleSharing}>
+              <button
+                className="px-3 py-2 bg-indigo-600 text-white rounded"
+                onClick={toggleSharing}
+              >
                 {sharing ? 'Stop Sharing' : 'Start Sharing'}
               </button>
-              <button className="ml-2 px-3 py-2 bg-white border rounded" onClick={openProfileModal}>
+
+              <button
+                className="ml-2 px-3 py-2 bg-white border rounded"
+                onClick={openProfileModal}
+              >
                 Profile
               </button>
             </div>
 
             <div className="mt-4 text-sm text-gray-600">
               <div>Role: <strong>{userRole || '—'}</strong></div>
-              <div>Device: {deviceId}</div>
-              <div>Session: {sessionId ? sessionId.slice(0, 20) : '—'}</div>
-              {/* For customers show sharing status; for cleaners show Online/Offline or On Job */}
-              <div>Availability: <strong>
-                {userRole === 'cleaner'
-                  ? (activeJob ? 'On Job' : (isAvailable ? 'Online' : 'Offline'))
-                  : (userRole === 'customer' ? (sharing ? 'Online' : 'Offline') : '-')}
-              </strong></div>
+              <div>
+                Availability:{' '}
+                <strong>
+                  {userRole === 'cleaner'
+                    ? (activeJob
+                        ? 'On Job'
+                        : (isAvailable ? 'Online' : 'Offline'))
+                    : (userRole === 'customer'
+                        ? (sharing ? 'Online' : 'Offline')
+                        : '-')}
+                </strong>
+              </div>
             </div>
           </div>
 
-          {/* Notifications */}
+          {/* NOTIFICATIONS */}
           <div className="p-4 bg-white rounded shadow space-y-2">
             <h3 className="font-semibold">Notifications</h3>
 
             {customerNotice && (
-              <div className={`p-3 rounded ${customerNotice.type === 'error' ? 'bg-red-50' : customerNotice.type === 'success' ? 'bg-green-50' : 'bg-blue-50'}`}>
+              <div className={`p-3 rounded ${
+                customerNotice.type === 'error' ? 'bg-red-50'
+                : customerNotice.type === 'success' ? 'bg-green-50'
+                : 'bg-blue-50'
+              }`}>
                 <strong>{customerNotice.title}</strong>
                 <div>{customerNotice.body}</div>
-                <div className="mt-2"><button onClick={() => setCustomerNotice(null)} className="px-2 py-1 bg-gray-200 rounded">Dismiss</button></div>
+                <div className="mt-2">
+                  <button
+                    onClick={() => setCustomerNotice(null)}
+                    className="px-2 py-1 bg-gray-200 rounded"
+                  >
+                    Dismiss
+                  </button>
+                </div>
               </div>
             )}
 
             {incomingMessage && (
               <div className="p-2 bg-yellow-50 rounded">
                 <div><strong>Message:</strong> {incomingMessage.text}</div>
-                <div className="mt-2"><button onClick={() => { setChatWith(incomingMessage.senderId); setIncomingMessage(null); }} className="px-2 py-1 bg-gray-200 rounded">Open Chat</button></div>
+                <div className="mt-2">
+                  <button
+                    className="px-2 py-1 bg-gray-200 rounded"
+                    onClick={() => {
+                      setChatWith(incomingMessage.senderId);
+                      setIncomingMessage(null);
+                      // mark as read in unreadMessages handled by ChatBox close/interaction
+                    }}
+                  >
+                    Open Chat
+                  </button>
+                </div>
               </div>
             )}
 
-            {/* Active job or incoming request panel */}
+            {/* ACTIVE JOB PANEL */}
             {activeJob ? (
               <div className="p-2 border rounded">
                 <div className="font-semibold">Job active</div>
-                <div>Customer: {activeJob.customerUid}</div>
+                <div>Customer: {activeJob.customerName || activeJob.customerUid}</div>
                 <div>Booking: {activeJob.bookingId}</div>
                 <div className="mt-2 flex gap-2">
-                  <button className="px-2 py-1 bg-blue-500 text-white rounded" onClick={handleTrackCustomer} disabled={isProcessing}>Track Customer</button>
-                  <button className="px-2 py-1 bg-green-500 text-white rounded" onClick={finishJob} disabled={isProcessing}>Finish Job</button>
-                  <button className="px-2 py-1 bg-red-500 text-white rounded" onClick={() => cancelActiveJob('cancelled_by_cleaner')} disabled={isProcessing}>Cancel</button>
+
+                  <button
+                    className="px-2 py-1 bg-blue-500 text-white rounded"
+                    onClick={handleTrackCustomer}
+                    disabled={isProcessing}
+                  >
+                    Track Customer
+                  </button>
+
+                  <button
+                    className="px-2 py-1 bg-green-500 text-white rounded"
+                    onClick={finishJob}
+                    disabled={isProcessing}
+                  >
+                    Finish Job
+                  </button>
+
+                  <button
+                    className="px-2 py-1 bg-red-500 text-white rounded"
+                    onClick={() => cancelActiveJob('cancelled_by_cleaner')}
+                    disabled={isProcessing}
+                  >
+                    Cancel
+                  </button>
+
+                  {/* CHAT */}
+                  <button
+                    className="px-2 py-1 bg-indigo-600 text-white rounded"
+                    onClick={() => {
+                      const target =
+                        userRole === 'cleaner'
+                          ? activeJob.customerUid
+                          : activeJob.cleanerUid;
+                      if (!target) return alert('Chat target missing');
+                      setChatWith(target);
+                    }}
+                  >
+                    Chat
+                  </button>
                 </div>
               </div>
             ) : incomingRequest ? (
               <div className="p-2 border rounded">
                 <div className="font-semibold">Incoming Request</div>
-                <div>From: {incomingRequest.from}</div>
+                <div>From: {incomingRequest.customerName || incomingRequest.fromName || incomingRequest.from}</div>
                 <div className="mt-2 flex gap-2">
-                  <button className="px-2 py-1 bg-blue-500 text-white rounded" onClick={handleTrackCustomer}>Track</button>
-                  <button className="px-2 py-1 bg-green-500 text-white rounded" onClick={acceptRequest} disabled={isProcessing}>
+
+                  <button
+                    className="px-2 py-1 bg-blue-500 text-white rounded"
+                    onClick={handleTrackCustomer}
+                  >
+                    Track
+                  </button>
+
+                  <button
+                    className="px-2 py-1 bg-green-500 text-white rounded"
+                    onClick={acceptRequest}
+                    disabled={isProcessing}
+                  >
                     {isProcessing ? 'Accepting...' : 'Accept'}
                   </button>
-                  <button className="px-2 py-1 bg-red-500 text-white rounded" onClick={async () => {
-                    await rtdbSet(rtdbRef(database, `requests/${user.uid}`), { ...incomingRequest, status: 'rejected' });
-                    setIncomingRequest(null);
-                  }} disabled={isProcessing}>Reject</button>
+
+                  <button
+                    className="px-2 py-1 bg-red-500 text-white rounded"
+                    disabled={isProcessing}
+                    onClick={async () => {
+                      await rtdbSet(
+                        rtdbRef(database, `requests/${user.uid}`),
+                        { ...incomingRequest, status: 'rejected' }
+                      );
+                      setIncomingRequest(null);
+                    }}
+                  >
+                    Reject
+                  </button>
+
                 </div>
               </div>
             ) : null}
 
-            {currentCustomerRequest && userRole === 'customer' && currentCustomerRequest.status !== 'paid' && (
+            {/* CUSTOMER REQUEST PANEL */}
+            {currentCustomerRequest &&
+             userRole === 'customer' &&
+             currentCustomerRequest.status !== 'paid' && (
               <div className="p-2 border rounded">
-                <div><strong>Your request is:</strong> {currentCustomerRequest.status}</div>
-                <div className="mt-2">
-                  <button className="px-2 py-1 bg-red-500 text-white rounded" onClick={cancelCustomerRequest}>Cancel Request</button>
+                <div>
+                  <strong>Your request is:</strong>{' '}
+                  {currentCustomerRequest.status}
                 </div>
+
+                <div className="mt-2 flex gap-2">
+
+                  <button
+                    className="px-2 py-1 bg-red-500 text-white rounded"
+                    onClick={cancelCustomerRequest}
+                  >
+                    Cancel Request
+                  </button>
+
+                  {(currentCustomerRequest.status === 'accepted' ||
+                    activeJob) && (
+                    <button
+                      className="px-2 py-1 bg-indigo-600 text-white rounded"
+                      onClick={() => {
+                        const target =
+                          currentCustomerRequest.cleanerUid ||
+                          activeJob?.cleanerUid;
+                        if (!target)
+                          return alert('Cleaner not ready for chat.');
+                        setChatWith(target);
+                      }}
+                    >
+                      Chat
+                    </button>
+                  )}
+
+                </div>
+
+                              {/* CLEANER PROFILE MODAL */}
+              {showCleanerProfilePanel && (
+                  <div className="bg-blue-100 p-4 mt-3 rounded shadow w-full max-w-md">
+                    {/* Header */}
+                    <div className="flex justify-between items-center mb-4">
+                      <h3 className="text-xl font-semibold">
+                        {cleanerProfile ? cleanerProfile.name : 'Loading...'}
+                      </h3>
+                      <button
+                        onClick={() => setShowCleanerProfilePanel(false)}
+                        className="px-2 py-1 text-gray-600 hover:text-gray-800"
+                      >
+                        Close
+                      </button>
+                    </div>
+
+                    {/* Role */}
+                    <p className="text-sm text-gray-500 mb-2">Role: Cleaner</p>
+
+                    {/* Ratings */}
+                    {cleanerProfile ? (
+                      <div className="flex items-center mb-2">
+                        {Array.from({ length: 5 }).map((_, i) => {
+                          const starValue = i + 1;
+                          if (cleanerProfile.avgRating >= starValue) {
+                            return <span key={i} className="text-yellow-400 text-xl">★</span>;
+                          } else if (cleanerProfile.avgRating >= starValue - 0.5) {
+                            return <span key={i} className="text-yellow-400 text-xl">⯨</span>; // half star fallback
+                          } else {
+                            return <span key={i} className="text-gray-300 text-xl">★</span>;
+                          }
+                        })}
+                        <span className="ml-2 text-gray-700 font-medium">
+                          {cleanerProfile.avgRating.toFixed(1)} ({cleanerProfile.ratingCount})
+                        </span>
+                      </div>
+                    ) : (
+                      <p>Loading ratings...</p>
+                    )}
+
+                    {/* Completed Jobs */}
+                    {cleanerProfile && (
+                      <p className="text-sm text-gray-600">
+                        Completed Jobs: {cleanerProfile.completedJobs}
+                      </p>
+                    )}
+
+                    {/* Bio */}
+                    {cleanerProfile?.bio && <p className="mt-2 text-gray-700">{cleanerProfile.bio}</p>}
+                  </div>
+                
+              )}
+              
+
               </div>
             )}
+            
+            
           </div>
 
-          {/* Chat / unread */}
-          <div className="p-4 bg-white rounded shadow">
-            <h3 className="font-semibold">Chats</h3>
-            {Object.keys(unreadMessages).length > 0 ? (
-              <div>
-                <p>You have {Object.keys(unreadMessages).length} unread conversation(s)</p>
-                <button className="px-2 py-1 bg-indigo-600 text-white rounded" onClick={() => {
-                  const first = Object.keys(unreadMessages)[0];
-                  setChatWith(first);
-                  setUnreadMessages(prev => { const c = { ...prev }; delete c[first]; return c; });
-                }}>Open</button>
-              </div>
-            ) : <p>No unread messages</p>}
-          </div>
         </div>
 
-        {/* Middle column: Map */}
-        <div className="col-span-2 lg:col-span-2">
-          <div className="bg-white rounded shadow p-2">
-            <h2 className="text-lg font-semibold mb-2">Map</h2>
-            <div style={{ height: '60vh' }} className="rounded overflow-hidden">
-              <MapContainer center={[0, 0]} zoom={2} className="h-full w-full">
-                {(targetCoords || currentCoords) && <RecenterMap coords={targetCoords || currentCoords} trigger={recenterTrigger} />}
-                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
+        {/* CENTER MAP */}
+        <div className="bg-white rounded h-[100%] shadow p-2">
+          <h2 className="text-lg font-semibold mb-2">Map</h2>
 
-                {/* Route if tracking */}
-                {currentCoords && customerCoords && activeJob && <ManualRoute from={currentCoords} to={customerCoords} />}
-                {currentCoords && targetCoords && <ManualRoute from={currentCoords} to={targetCoords} />}
+          <div style={{ height: '80vh' }} className="rounded overflow-hidden">
+            <MapContainer
+              center={[0, 0]}
+              zoom={2}
+              className="h-full w-full"
+            >
+              {(targetCoords || currentCoords) && (
+                <RecenterMap
+                  coords={targetCoords || currentCoords}
+                  trigger={recenterTrigger}
+                />
+              )}
 
-                {/* Current device marker */}
-                {currentCoords && (
-                  <Marker position={[currentCoords.lat, currentCoords.lng]} icon={userMarkerIcon}>
-                    <Popup>You (this device)</Popup>
-                  </Marker>
-                )}
+              <TileLayer
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                attribution="&copy; OpenStreetMap contributors"
+              />
 
-                {/* Hardcoded demo cleaners */}
-                {hardcodedCleaners.map((c) => (
-                  <Marker key={c.id} position={[c.lat, c.lng]} icon={createRoleIcon('https://img.icons8.com/ios-filled/50/000000/broom.png', 'cleaner')}>
-                    <Popup>
-                      <div>
-                        <strong>Demo Cleaner: {c.id}</strong>
-                        <div className="mt-2">
-                          <button className="px-2 py-1 bg-blue-500 text-white rounded" onClick={() => {
+              {currentCoords && customerCoords && activeJob && (
+                <ManualRoute from={currentCoords} to={customerCoords} />
+              )}
+
+              {currentCoords && targetCoords && (
+                <ManualRoute from={currentCoords} to={targetCoords} />
+              )}
+
+              {/* SELF MARKER */}
+              {currentCoords && (
+                <Marker
+                  position={[currentCoords.lat, currentCoords.lng]}
+                  icon={userMarkerIcon}
+                >
+                  <Popup>You (this device)</Popup>
+                </Marker>
+              )}
+
+              {/* HARDCODED CLEANERS */}
+              {hardcodedCleaners.map((c) => (
+                <Marker
+                  key={c.id}
+                  position={[c.lat, c.lng]}
+                  icon={createRoleIcon(
+                    'https://img.icons8.com/ios-filled/50/000000/broom.png',
+                    'cleaner'
+                  )}
+                >
+                  <Popup>
+                    <div>
+                      <strong>Demo Cleaner: {c.id}</strong>
+                      <div className="mt-2">
+                        <button
+                          className="px-2 py-1 bg-blue-500 text-white rounded"
+                          onClick={() => {
                             setTargetCoords({ lat: c.lat, lng: c.lng });
-                            setRecenterTrigger(t => t + 1);
-                          }}>Track This Cleaner</button>
-                        </div>
+                            setRecenterTrigger((t) => t + 1);
+                          }}
+                        >
+                          Track This Cleaner
+                        </button>
                       </div>
-                    </Popup>
-                  </Marker>
-                ))}
+                    </div>
+                  </Popup>
+                </Marker>
+              ))}
 
-                {/* Live visible markers */}
-                {visibleMarkers.map(([id, loc]) => {
-                  const isSelf = loc.sessionId === sessionId || loc.uid === user?.uid;
-                  return (
-                    <Marker key={id} position={[loc.lat, loc.lng]} icon={createRoleIcon(
-                      loc.role === 'cleaner'
-                        ? 'https://img.icons8.com/ios-filled/50/000000/broom.png'
-                        : 'https://img.icons8.com/ios-filled/50/000000/user.png',
-                      loc.role
-                    )}>
-                      <Popup>
-                        {renderPopupContentJSX(loc)}
-                      </Popup>
-                    </Marker>
-                  );
-                })}
+              {/* VISIBLE MARKERS */}
+              {visibleMarkers.map(([id, loc]) => (
+                <Marker
+                  key={id}
+                  position={[loc.lat, loc.lng]}
+                  icon={createRoleIcon(
+                    loc.role === 'cleaner'
+                      ? 'https://img.icons8.com/ios-filled/50/000000/broom.png'
+                      : 'https://img.icons8.com/ios-filled/50/000000/user.png',
+                    loc.role
+                  )}
+                >
+                  <Popup>{renderPopupContentJSX(loc)}</Popup>
+                </Marker>
+              ))}
 
-              </MapContainer>
-            </div>
+            </MapContainer>
           </div>
         </div>
+
+        {/* RIGHT CHAT PANEL */}
+        <div style={{
+          position: 'relative',
+          overflow: 'hidden',
+          transition: 'background 0.25s ease'
+        }}>
+          {chatWith && user?.uid && (
+            <div style={{
+              position: 'absolute',
+              inset: 0,
+              transform: chatWith ? 'translateX(0)' : 'translateX(100%)',
+              transition: 'transform 0.30s ease',
+            }}>
+              <ChatBox
+                conversationId={generateConversationId(user.uid, chatWith)}
+                recipientId={chatWith}
+                onClose={() => setChatWith(null)}
+                userRole={userRole}
+              />
+            </div>
+          )}
+        </div>
+
       </div>
 
-      {/* Profile Modal */}
+      {/* DASHBOARD MODAL */}
+      {ShowDashboardModal && (
+        <div className="fixed inset-0 bg-black/40 z-[10000]">
+          <DashBoard
+            user={user}
+            role={userRole}
+            onClose={() => setShowDashboardModal(false)}
+          />
+        </div>
+      )}
+
+      {/* PROFILE MODAL */}
       {showProfileModal && (
         <div className="fixed inset-0 flex items-center justify-center bg-black/40 z-[9999]">
-          <div className="bg-white p-4 rounded shadow w-full max-w-lg z-[10000]">
+          <div className="bg-white p-4 rounded shadow w-full max-w-lg">
             <div className="flex justify-between items-center mb-2">
               <h3 className="font-semibold">Profile</h3>
-              <button onClick={() => setShowProfileModal(false)} className="px-2 py-1">Close</button>
+              <button
+                onClick={() => setShowProfileModal(false)}
+                className="px-2 py-1"
+              >
+                Close
+              </button>
             </div>
-            <ProfileForm user={user} role={userRole} onClose={() => setShowProfileModal(false)} />
+
+            <ProfileForm
+              user={user}
+              role={userRole}
+              onClose={() => setShowProfileModal(false)}
+            />
           </div>
         </div>
       )}
 
-      {/* Payment Modal (demo) */}
+      {/* PAYMENT MODAL */}
       {showPaymentModal && (
         <div className="fixed inset-0 flex items-center justify-center bg-black/40 z-[9999]">
-          <div className="bg-white p-4 rounded shadow w-full max-w-md relative z-[10000]">
-            <h3 className="font-semibold">Payment (Demo)</h3>
-            <p className="text-sm text-gray-600">Enter the amount to pay the cleaner. (Demo mode — no gateway)</p>
+          <div className="bg-white p-4 rounded shadow w-full max-w-md relative">
+            <h3 className="font-semibold">Payment</h3>
+            <p className="text-sm text-gray-600">
+              Enter the amount to pay the cleaner.
+            </p>
 
-            <div className="mt-3">
-              <label className="block text-sm">Amount</label>
-              <input
-                type="text"
-                value={paymentAmount}
-                onChange={(e) => setPaymentAmount(e.target.value)}
-                className="w-full border p-2 rounded"
-                placeholder="e.g. 500"
-              />
-            </div>
+            {!paymentReceipt && (
+              <>
+                <div className="mt-3">
+                  <label className="block text-sm">Amount</label>
+                  <input
+                    type="text"
+                    value={paymentAmount}
+                    onChange={(e) => setPaymentAmount(e.target.value)}
+                    className="w-full border p-2 rounded"
+                    placeholder="e.g. 500"
+                  />
+                </div>
 
-            <div className="mt-4 flex gap-2">
-              <button
-                className="px-3 py-2 bg-green-600 text-white rounded"
-                onClick={submitPayment}
-                disabled={isProcessing}
-              >
-                {isProcessing ? 'Processing...' : 'Submit Payment'}
-              </button>
+                <div className="mt-4 flex gap-2">
+                  <button
+                    className="px-3 py-2 bg-green-600 text-white rounded"
+                    onClick={submitPayment}
+                    disabled={isProcessing}
+                  >
+                    {isProcessing ? 'Processing...' : 'Submit Payment'}
+                  </button>
 
-              <button
-                className="px-3 py-2 bg-gray-200 rounded"
-                onClick={() => setShowPaymentModal(false)}
-                disabled={isProcessing}
-              >
-                Cancel
-              </button>
-            </div>
+                  <button
+                    className="px-3 py-2 bg-gray-200 rounded"
+                    onClick={() => setShowPaymentModal(false)}
+                    disabled={isProcessing}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            )}
 
             {paymentReceipt && (
               <div className="mt-3 p-2 border rounded">
                 <div><strong>Receipt ID:</strong> {paymentReceipt.id}</div>
                 <div><strong>Amount:</strong> {paymentReceipt.amount}</div>
+
                 <div className="mt-2 flex gap-2">
-                  <button className="px-3 py-2 bg-indigo-600 text-white rounded" onClick={() => {
-                    // print with best-effort cleaner/customer names if available
-                    const cleanerName = (ratingBookingContext && ratingBookingContext.cleanerId) || activeJob?.cleanerUid || currentCustomerRequest?.cleanerUid || 'Cleaner';
-                    const customerName = userName || 'Customer';
-                    printReceipt(paymentReceipt, paymentBookingId || activeJob?.bookingId || currentRequestId, cleanerName, customerName);
-                  }}>Print Receipt</button>
+
+                  <button
+                    className="px-3 py-2 bg-indigo-600 text-white rounded"
+                    onClick={() => {
+                      const cleanerName =
+                        (ratingBookingContext &&
+                        ratingBookingContext.cleanerId) ||
+                        activeJob?.cleanerUid ||
+                        currentCustomerRequest?.cleanerUid ||
+                        'Cleaner';
+
+                      const customerName = userName || 'Customer';
+
+                      printReceipt(
+                        paymentReceipt,
+                        paymentBookingId || activeJob?.bookingId || currentRequestId,
+                        cleanerName,
+                        customerName
+                      );
+                    }}
+                  >
+                    Print Receipt
+                  </button>
+
+                  <button
+                    className="px-3 py-2 bg-green-600 text-white rounded"
+                    onClick={() => {
+                      setShowPaymentModal(false);
+                      setShowRatingModal(true);
+                    }}
+                  >
+                    Continue to Rating
+                  </button>
+
+                  <button
+                    className="px-3 py-2 bg-gray-200 rounded"
+                    onClick={() => setShowPaymentModal(false)}
+                  >
+                    Close
+                  </button>
+
                 </div>
               </div>
             )}
+
           </div>
         </div>
       )}
 
-      {/* Rating Modal */}
+      {/* RATING MODAL */}
       {showRatingModal && ratingBookingContext && (
         <div className="fixed inset-0 flex items-center justify-center bg-black/40 z-[9999]">
-          <div className="bg-white p-4 rounded shadow w-full max-w-md z-[10000]">
+          <div className="bg-white p-4 rounded shadow w-full max-w-md">
             <h3 className="font-semibold">Rate your Cleaner</h3>
-            <p className="text-sm text-gray-600">Rate 1 (worst) - 5 (best)</p>
+            <p className="text-sm text-gray-600">1 (worst) - 5 (best)</p>
+
             <div className="mt-3 flex gap-2">
-              {[1,2,3,4,5].map((s) => (
-                <button key={s} className="px-3 py-2 bg-yellow-300 rounded" onClick={() => {
-                  // capture rating and submit
-                  submitRating(s, '');
-                }}>{s}★</button>
+              {[1, 2, 3, 4, 5].map((s) => (
+                <button
+                  key={s}
+                  className="px-3 py-2 bg-yellow-300 rounded"
+                  onClick={() => submitRating(s, '')}
+                >
+                  {s}★
+                </button>
               ))}
             </div>
+
             <div className="mt-3">
-              <button className="px-3 py-2 bg-gray-200 rounded" onClick={() => setShowRatingModal(false)}>Close</button>
+              <button
+                className="px-3 py-2 bg-gray-200 rounded"
+                onClick={() => setShowRatingModal(false)}
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Chat box */}
-      {chatWith && user?.uid && (
-        <ChatBox conversationId={[user.uid, chatWith].sort().join('_')} recipientId={chatWith} onClose={() => setChatWith(null)} />
-      )}
     </div>
   );
 }

@@ -4,7 +4,6 @@ import {
   Card,
   CardContent,
   Typography,
-  Avatar,
   Stack,
   Box,
   TextField,
@@ -12,50 +11,74 @@ import {
   Rating,
   Divider
 } from "@mui/material";
-import EditIcon from "@mui/icons-material/Edit";
-import SaveIcon from "@mui/icons-material/Save";
-import CancelIcon from "@mui/icons-material/Close";
-import PhotoCamera from "@mui/icons-material/PhotoCamera";
 
-import { getUserById, updateUser, createUserProfile } from "../services/userService";
+import {
+  getUserById,
+  updateUser,
+  createUserProfile
+} from "../services/userService";
+
 import { getAverageRatingForCleaner } from "../services/ratingService";
+import { markProfileComplete } from "../services/userSessionService";
 
-import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
-import { storage } from "../firebaseConfig";
+import { database } from "../firebaseConfig";
+import { ref as rtdbRef, get as rtdbGet, update as rtdbUpdate } from "firebase/database";
 
-export default function ProfileForm({ user, onClose }) {
+export default function ProfileForm({ user }) {
   const [profile, setProfile] = useState(null);
   const [editing, setEditing] = useState(false);
-  const [imageFile, setImageFile] = useState(null);
-  const [previewURL, setPreviewURL] = useState("");
   const [avgRating, setAvgRating] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [roleFromRTDB, setRoleFromRTDB] = useState("customer");
 
   useEffect(() => {
-    if (user?.uid) loadProfile(user.uid);
+    if (user?.uid) loadProfileFromSession(user.uid);
   }, [user?.uid]);
 
-  const loadProfile = async (uid) => {
-    let data = await getUserById(uid);
+  // 1. Load profile: Firestore preferred, fallback to RTDB
+  const loadProfileFromSession = async (uid) => {
+    let firestoreData = await getUserById(uid);
+    let rtdbData = {};
 
-    if (!data) {
-      data = {
-        uid,
-        name: user.displayName || `Guest-${uid.slice(0,6)}`,
-        email: user.email || "",
-        phone: "",
-        role: "customer",
-        rating: 0,
-        ratingCount: 0,
-        photoURL: ""
-      };
-      await createUserProfile(data);
+    try {
+      const snap = await rtdbGet(rtdbRef(database, `locations`));
+      rtdbData = snap.val() || {};
+    } catch (err) {
+      console.warn("RTDB fetch error:", err);
     }
 
-    setProfile(data);
-    setPreviewURL(data.photoURL || "");
+    // Try to find user in RTDB
+    let rtdbUser = null;
+    for (const key in rtdbData) {
+      if (rtdbData[key].uid === uid) {
+        rtdbUser = rtdbData[key];
+        break;
+      }
+    }
 
-    if (data.role === "cleaner") {
+    const role = rtdbUser?.role || "customer";
+    setRoleFromRTDB(role);
+
+    // Build profile
+    let data = firestoreData || {
+      uid,
+      name: rtdbUser?.name || `Guest-${uid.slice(0, 6)}`,
+      email: rtdbUser?.email || "",
+      phone: rtdbUser?.phone || "",
+      role,
+      rating: 0,
+      ratingCount: 0,
+      photoURL: "",
+      profileComplete: false
+    };
+
+    // Ensure Firestore has record
+    if (!firestoreData) await createUserProfile(data);
+
+    setProfile(data);
+
+    // For cleaners, load avg rating
+    if (role === "cleaner") {
       const ratingValue = await getAverageRatingForCleaner(uid);
       setAvgRating(ratingValue);
     } else {
@@ -67,34 +90,45 @@ export default function ProfileForm({ user, onClose }) {
     setProfile((prev) => ({ ...prev, [e.target.name]: e.target.value }));
   };
 
-  const handleImageChange = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setImageFile(file);
-    setPreviewURL(URL.createObjectURL(file));
-  };
-
+  // 2. Save profile & sync RTDB
   const saveProfile = async () => {
     if (!profile) return;
     setSaving(true);
 
     try {
-      if (imageFile) {
-        const key = `profileImages/${profile.uid}_${Date.now()}`;
-        const sRef = storageRef(storage, key);
-        await uploadBytes(sRef, imageFile);
-        const url = await getDownloadURL(sRef);
-        profile.photoURL = url;
+      profile.role = roleFromRTDB; // enforce role
+
+      // Update Firestore
+      await updateUser(profile.uid, profile);
+
+      // Mark complete
+      await markProfileComplete(profile.uid);
+
+      // Update RTDB where applicable
+      try {
+        const snap = await rtdbGet(rtdbRef(database, `locations`));
+        const rtdbData = snap.val() || {};
+        for (const key in rtdbData) {
+          if (rtdbData[key].uid === profile.uid) {
+            await rtdbUpdate(rtdbRef(database, `locations/${key}`), {
+              name: profile.name,
+              email: profile.email,
+              phone: profile.phone
+            });
+            break;
+          }
+        }
+      } catch (err) {
+        console.warn("RTDB update error:", err);
       }
 
-      await updateUser(profile.uid, profile);
-      await loadProfile(profile.uid);
+      // Reload latest profile
+      await loadProfileFromSession(profile.uid);
 
       setEditing(false);
-      setImageFile(null);
     } catch (err) {
-      console.error(err);
-      alert("Failed to save profile. See console for details.");
+      console.error("Save error:", err);
+      alert("Could not save profile.");
     } finally {
       setSaving(false);
     }
@@ -114,22 +148,23 @@ export default function ProfileForm({ user, onClose }) {
     <Card sx={{ maxWidth: 500, margin: "2rem auto", p: 2 }}>
       <CardContent>
         <Stack spacing={2} alignItems="center">
-          {/* Avatar & Name */}
-          <Avatar src={previewURL} sx={{ width: 100, height: 100 }} />
           <Typography variant="h5">{profile.name || "-"}</Typography>
-          <Typography color="text.secondary">{profile.role}</Typography>
+          <Typography color="text.secondary">
+            Role: {roleFromRTDB || "-"}
+          </Typography>
 
-          {/* Rating if cleaner */}
-          {profile.role === "cleaner" && (
+          {/* Rating only for cleaners */}
+          {roleFromRTDB === "cleaner" && (
             <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
               <Rating value={Number(avgRating) || 0} precision={0.5} readOnly />
-              <Typography variant="body2">({avgRating ? Number(avgRating).toFixed(1) : "0.0"})</Typography>
+              <Typography variant="body2">
+                ({avgRating ? Number(avgRating).toFixed(1) : "0.0"})
+              </Typography>
             </Box>
           )}
 
           <Divider sx={{ width: "100%", my: 1 }} />
 
-          {/* Display mode */}
           {!editing && (
             <>
               <Typography variant="subtitle2">Email</Typography>
@@ -140,7 +175,6 @@ export default function ProfileForm({ user, onClose }) {
 
               <Button
                 variant="contained"
-                startIcon={<EditIcon />}
                 sx={{ mt: 2 }}
                 onClick={() => setEditing(true)}
               >
@@ -149,7 +183,6 @@ export default function ProfileForm({ user, onClose }) {
             </>
           )}
 
-          {/* Edit mode */}
           {editing && (
             <Stack spacing={2} sx={{ width: "100%" }}>
               <TextField
@@ -157,48 +190,32 @@ export default function ProfileForm({ user, onClose }) {
                 name="name"
                 value={profile.name}
                 onChange={handleChange}
-                fullWidth
               />
+
               <TextField
                 label="Email"
                 name="email"
                 value={profile.email}
                 onChange={handleChange}
-                fullWidth
               />
+
               <TextField
                 label="Phone"
                 name="phone"
                 value={profile.phone}
                 onChange={handleChange}
-                fullWidth
               />
-
-              <Button
-                variant="contained"
-                component="label"
-                startIcon={<PhotoCamera />}
-              >
-                Upload Photo
-                <input hidden accept="image/*" type="file" onChange={handleImageChange} />
-              </Button>
-              {imageFile && <Typography variant="body2">{imageFile.name}</Typography>}
 
               <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 1 }}>
                 <Button
                   variant="outlined"
-                  startIcon={<CancelIcon />}
-                  onClick={() => {
-                    setEditing(false);
-                    setImageFile(null);
-                    setPreviewURL(profile.photoURL || "");
-                  }}
+                  onClick={() => setEditing(false)}
                 >
                   Cancel
                 </Button>
+
                 <Button
                   variant="contained"
-                  startIcon={<SaveIcon />}
                   onClick={saveProfile}
                   disabled={saving}
                 >

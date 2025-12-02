@@ -1,9 +1,9 @@
 .chatbox-container {
   position: fixed;
-  bottom: 20px;
+  top: 0px;
   right: 20px;
   width: 310px;
-  max-height: 50vh;
+  max-height: 97vh;
   display: flex;
   flex-direction: column;
   background-color: #ffffff;

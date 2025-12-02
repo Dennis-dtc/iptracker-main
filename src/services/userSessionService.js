@@ -1,65 +1,123 @@
 // src/userSessionService.js
-import { auth, firestore, signInAnonymously } from "../firebaseConfig";
-import { doc, setDoc, serverTimestamp, getDoc } from "firebase/firestore";
+import { auth, firestore, database, signInAnonymously } from "../firebaseConfig";
+import {
+  doc,
+  setDoc,
+  serverTimestamp,
+  getDoc,
+  deleteDoc
+} from "firebase/firestore";
+import { ref as dbRef, remove } from "firebase/database";
 
 /**
- * Initializes a user session.
- * If not logged in, signs in anonymously.
- * Creates or updates Firestore profile accordingly (matching full profile structure).
+ * Strict anonymous session logic:
+ * - Forces new + existing anonymous users to "anonymous mode"
+ * - Cleanup timer deletes them if profile is not completed
  */
 export async function initUserSession(role = "customer") {
   try {
-    // Authenticate anonymously
+    // Firebase anonymous auth
     const userCred = await signInAnonymously(auth);
     const user = userCred.user;
     const uid = user.uid;
 
     const userRef = doc(firestore, "users", uid);
-    const existingSnap = await getDoc(userRef);
+    const existing = await getDoc(userRef);
 
-    // If user already has a saved profile, DO NOT overwrite it.
-    if (existingSnap.exists()) {
-      const data = existingSnap.data();
+    // CASE 1. Existing user — force anonymous mode again
+    if (existing.exists()) {
+      console.log("Existing user detected, forcing anonymous mode:", uid);
 
-      // Only update role if user is first time choosing one (optional)
-      if (!data.role) {
-        await setDoc(
-          userRef,
-          {
-            role,
-            updatedAt: serverTimestamp()
-          },
-          { merge: true }
-        );
-      }
+      await setDoc(
+        userRef,
+        {
+          anonymous: true,
+          profileComplete: false,
+          role,
+          updatedAt: serverTimestamp()
+        },
+        { merge: true }
+      );
 
-      console.log(`🔄 Existing user session resumed: ${uid}`);
-      return { id: uid, ...existingSnap.data() };
+      // Restart cleanup timer
+      startAnonymousCleanupTimer(uid);
+
+      return { id: uid, ...existing.data() };
     }
 
-    // New anonymous user: create full profile structure
-    const newProfile = {
+    // CASE 2. New anonymous user profile
+    const profile = {
       uid,
       name: `Guest-${uid.slice(0, 5)}`,
-      email: "",                // empty until user edits in Profile
-      phone: "",                // empty until user edits
-      role,                     // "customer" or "cleaner"
+      role,
+      email: "",
+      phone: "",
       anonymous: true,
+      profileComplete: false,
       status: role === "cleaner" ? "offline" : "active",
-      rating: 0,
-      ratingCount: 0,
-      photoURL: "",            // added for ProfileForm
-      category: null,
-      meta: {},
       createdAt: serverTimestamp()
     };
 
-    await setDoc(userRef, newProfile, { merge: true });
+    await setDoc(userRef, profile, { merge: true });
 
-    console.log(`✅ Anonymous ${role} session started: ${uid}`);
-    return { id: uid, ...newProfile };
+    console.log("New anonymous session created:", uid);
+
+    startAnonymousCleanupTimer(uid);
+    return { id: uid, ...profile };
   } catch (err) {
-    console.error("❌ Error initializing anonymous session:", err);
+    console.error("Error in initUserSession:", err);
     throw err;
+  }
+}
+
+/**
+ * Auto-delete anonymous users after 2 minutes if profile is not completed.
+ */
+function startAnonymousCleanupTimer(uid) {
+  console.log("Starting cleanup timer for:", uid);
+
+  setTimeout(async () => {
+    try {
+      const userRef = doc(firestore, "users", uid);
+      const snap = await getDoc(userRef);
+
+      if (!snap.exists()) return;
+
+      const data = snap.data();
+
+      // If they completed profile or became real user → do NOT delete
+      if (data.profileComplete === true) {
+        console.log("User completed profile, keeping:", uid);
+        return;
+      }
+
+      // Still anonymous + incomplete → DELETE
+      console.log("Auto-deleting anonymous incomplete user:", uid);
+
+      await deleteDoc(userRef);
+      await remove(dbRef(database, `locations/${uid}`));
+      auth.signOut();
+
+    } catch (err) {
+      console.error("Cleanup error:", err);
+    }
+  }, 2 * 60 * 1000); // 2 minutes
+}
+
+/**
+ * Call when user finishes profile.
+ */
+export async function markProfileComplete(uid) {
+  try {
+    const userRef = doc(firestore, "users", uid);
+    await setDoc(
+      userRef,
+      { profileComplete: true, anonymous: false },
+      { merge: true }
+    );
+
+    console.log("Profile marked complete:", uid);
+  } catch (err) {
+    console.error("Error marking profile complete:", err);
   }
 }
