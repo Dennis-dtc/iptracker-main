@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>404 — Not Found</title>
+  <meta name="robots" content="noindex" />
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; background:#f8fafc; color:#0f172a }
+    .card { max-width:720px; width:90%; background:white; border-radius:12px; padding:28px; box-shadow:0 6px 24px rgba(15,23,42,0.08); text-align:center }
+    h1{ margin:0 0 6px; font-size:28px }
+    p{ margin:0 0 16px; color:#475569 }
+    a.button{ display:inline-block; padding:10px 16px; background:#0ea5a4; color:white; border-radius:8px; text-decoration:none }
+    .muted{ color:#94a3b8; font-size:13px; margin-top:12px }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>404 — Page Not Found</h1>
+    <p>We couldn't find the page you requested. If this happened while reloading or opening a bookmarked page, we'll try to restore the app automatically.</p>
+    <a class="button" href="/iptracker-main/">Return to home</a>
+    <div class="muted">If the automatic fallback doesn't work, check the URL or return to the home page.</div>
+  </div>
+
+  <script>
+    // SPA-friendly 404 fallback for GitHub Pages: try to load index.html and let the client router handle the current path
+    (function(){
+      var base = (location.origin || (location.protocol + '//' + location.host)) + '/iptracker-main/';
+      var indexUrl = base + 'index.html';
+      fetch(indexUrl, { cache: 'no-cache' }).then(function(r){
+        return r.text();
+      }).then(function(html){
+        // Replace document with index.html content so the SPA can handle the original path
+        document.open();
+        document.write(html);
+        document.close();
+      }).catch(function(){
+        // If it fails, do nothing — the 404 UI above remains visible
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,19 +1,19 @@
 {
   "files": {
-    "main.css": "/iptracker-main/static/css/main.66aa4d1c.css",
-    "main.js": "/iptracker-main/static/js/main.20cb3d55.js",
+    "main.css": "/iptracker-main/static/css/main.f4182c6b.css",
+    "main.js": "/iptracker-main/static/js/main.33a26677.js",
     "static/js/239.d736efcd.chunk.js": "/iptracker-main/static/js/239.d736efcd.chunk.js",
     "static/js/977.9d6ba03d.chunk.js": "/iptracker-main/static/js/977.9d6ba03d.chunk.js",
     "static/js/455.1812b214.chunk.js": "/iptracker-main/static/js/455.1812b214.chunk.js",
     "index.html": "/iptracker-main/index.html",
-    "main.66aa4d1c.css.map": "/iptracker-main/static/css/main.66aa4d1c.css.map",
-    "main.20cb3d55.js.map": "/iptracker-main/static/js/main.20cb3d55.js.map",
+    "main.f4182c6b.css.map": "/iptracker-main/static/css/main.f4182c6b.css.map",
+    "main.33a26677.js.map": "/iptracker-main/static/js/main.33a26677.js.map",
     "239.d736efcd.chunk.js.map": "/iptracker-main/static/js/239.d736efcd.chunk.js.map",
     "977.9d6ba03d.chunk.js.map": "/iptracker-main/static/js/977.9d6ba03d.chunk.js.map",
     "455.1812b214.chunk.js.map": "/iptracker-main/static/js/455.1812b214.chunk.js.map"
   },
   "entrypoints": [
-    "static/css/main.66aa4d1c.css",
-    "static/js/main.20cb3d55.js"
+    "static/css/main.f4182c6b.css",
+    "static/js/main.33a26677.js"
   ]
 }
